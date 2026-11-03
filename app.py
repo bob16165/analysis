@@ -42,6 +42,11 @@ with tab_run:
     min_conc = c6.slider("大項目への集中度の下限", 0.0, 1.0, 0.5, 0.05,
                          help="その語が出る全問題のうち、選択した大項目の問題が占める割合。下げるほど他領域にも出る語が増える")
 
+    st.caption(
+        "科目横断は、抽出語が比較先科目の問題文・選択肢に含まれる割合を集計します。"
+        "語句の一致は関連の手掛かりであり、複数科目の知識が必須の問題だと証明するものではありません。"
+    )
+
     if st.button("分析する", type="primary"):
         st.session_state["result"] = an.analyze(freq_file, past_file, subject, major, int(top_n), y_lo, y_hi, int(min_hits), float(min_conc))
 
@@ -50,6 +55,8 @@ with tab_run:
         for name, df in result.items():
             st.subheader(name)
             st.dataframe(df, width="stretch", hide_index=True)
+            if name == "科目横断の年度推移" and not df.empty:
+                st.line_chart(df.pivot(index="回", columns="科目", values="一致率(%)"))
         c1, c2 = st.columns(2)
         c1.download_button("Excelをダウンロード", an.to_excel_bytes(result), "出題傾向分析.xlsx")
         c2.download_button("AIレポート用Markdown", an.to_markdown(result), "出題傾向分析.md")

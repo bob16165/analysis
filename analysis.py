@@ -9,6 +9,11 @@ import terms
 
 DICT_PATH = Path(__file__).parent / "dictionary.json"
 CHOICE_COLS = ["選択肢1", "選択肢2", "選択肢3", "選択肢4"]
+RELATED_AXIS_SUBJECTS = ["リハ医学", "一般臨床", "整形外科", "柔道整復学"]
+CROSS_SUBJECTS = [
+    "運動学", "病理学", "リハ医学", "一般臨床", "外科学", "整形外科", "柔道整復学"
+]
+SUBJECT_LABELS = {"柔道整復学": "柔整理論"}
 
 
 def norm(x) -> str:
@@ -87,6 +92,99 @@ def axis_summary(tagged: pd.DataFrame, d: dict) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["関連軸", "問題数", "該当問題"])
 
 
+def cross_subject_analysis(question_sheets: dict[str, pd.DataFrame], source_subject: str,
+                           extracted_terms: pd.DataFrame, subjects=None) -> tuple:
+    """集計した語句が他科目の問題に現れる割合と、該当問題を返す。"""
+    subject_list = CROSS_SUBJECTS if subjects is None else subjects
+    words = []
+    if "語" in extracted_terms:
+        words = [(str(word), norm(word)) for word in extracted_terms["語"] if norm(word)]
+
+    summary_rows = []
+    yearly_rows = []
+    period_rows = []
+    question_rows = []
+    for subject in subject_list:
+        if subject == source_subject or subject not in question_sheets:
+            continue
+        questions = question_sheets[subject]
+        matched_by_year = {}
+        subject_name = SUBJECT_LABELS.get(subject, subject)
+
+        for _, question in questions.iterrows():
+            year = pd.to_numeric(question.get("回"), errors="coerce")
+            if pd.isna(year):
+                continue
+            values = [question.get("問題", "")] + [question.get(col, "") for col in CHOICE_COLS]
+            text = norm(" ".join("" if pd.isna(value) else str(value) for value in values))
+            matched_words = [word for word, normalized in words if normalized in text]
+            year = int(year)
+            matched_by_year.setdefault(year, [0, 0])
+            matched_by_year[year][0] += 1
+            matched_by_year[year][1] += bool(matched_words)
+            if matched_words:
+                question_rows.append({
+                    "科目": subject_name,
+                    "回": year,
+                    "問題ID": question.get("問題ID", ""),
+                    "一致語句": "、".join(matched_words),
+                    "問題": question.get("問題", ""),
+                })
+
+        total = sum(counts[0] for counts in matched_by_year.values())
+        hits = sum(counts[1] for counts in matched_by_year.values())
+        hit_terms = {
+            term for row in question_rows
+            if row["科目"] == subject_name
+            for term in row["一致語句"].split("、")
+        }
+        summary_rows.append({
+            "科目": subject_name,
+            "対象問題数(全回)": total,
+            "一致問題数(全回)": hits,
+            "一致率(%)": round(hits / total * 100, 1) if total else 0.0,
+            "一致語句数": len(hit_terms),
+        })
+
+        for year in sorted(matched_by_year):
+            year_total, year_hits = matched_by_year[year]
+            yearly_rows.append({
+                "科目": subject_name,
+                "回": year,
+                "対象問題数": year_total,
+                "一致問題数": year_hits,
+                "一致率(%)": round(year_hits / year_total * 100, 1),
+            })
+
+        for period, low, high in (("第1〜27回", 1, 27), ("第28〜34回", 28, 34)):
+            period_total = sum(
+                counts[0] for year, counts in matched_by_year.items() if low <= year <= high
+            )
+            period_hits = sum(
+                counts[1] for year, counts in matched_by_year.items() if low <= year <= high
+            )
+            period_rows.append({
+                "科目": subject_name,
+                "期間": period,
+                "対象問題数": period_total,
+                "一致問題数": period_hits,
+                "一致率(%)": round(period_hits / period_total * 100, 1) if period_total else 0.0,
+            })
+
+    return (
+        pd.DataFrame(summary_rows, columns=[
+            "科目", "対象問題数(全回)", "一致問題数(全回)", "一致率(%)", "一致語句数"
+        ]),
+        pd.DataFrame(yearly_rows, columns=[
+            "科目", "回", "対象問題数", "一致問題数", "一致率(%)"
+        ]),
+        pd.DataFrame(period_rows, columns=[
+            "科目", "期間", "対象問題数", "一致問題数", "一致率(%)"
+        ]),
+        pd.DataFrame(question_rows, columns=["科目", "回", "問題ID", "一致語句", "問題"]),
+    )
+
+
 MEDICAL_TERMS_PATH = Path(__file__).parent / "medical_terms.txt"
 
 
@@ -106,7 +204,11 @@ def analyze(freq_file, past_file, subject, major, top_n, year_min=28, year_max=3
     targets = ranking.loc[ranking["分析対象"], "中項目"].tolist()
     d = load_dictionary()
     # 語の出題回数は第1回からの全問題で数える。分析対象の抽出だけ対象回で絞る
-    all_q = load_questions(past_file, subject, 1, 999)
+    question_sheets = {
+        name: load_questions(past_file, name, 1, 999)
+        for name in sheet_names(past_file)
+    }
+    all_q = question_sheets[subject]
     qs = all_q[(all_q["大項目"] == major) & all_q["中項目"].isin(targets) & all_q["回"].between(year_min, year_max)]
     tagged = tag_questions(qs, d).sort_values(["中項目", "回", "問題ID"])
     stop = {terms.norm(w) for w in d.get("除外語", [])}
@@ -115,12 +217,23 @@ def analyze(freq_file, past_file, subject, major, top_n, year_min=28, year_max=3
     related = {terms.norm(k): v for k, v in d["重要語(疾患・所見)"].items()}
     curated = load_medical_terms() + list(d["重要語(疾患・所見)"])
     freq_terms = terms.related_terms(all_q, major, targets, curated, stop, exact_stop, related, min_hits, min_conc)
+    cross_summary, cross_yearly, cross_periods, cross_questions = cross_subject_analysis(
+        question_sheets, subject, freq_terms
+    )
+    related_axis = cross_summary[
+        cross_summary["科目"].isin(SUBJECT_LABELS.get(s, s) for s in RELATED_AXIS_SUBJECTS)
+    ].reset_index(drop=True)
     return {
         "条件": pd.DataFrame(
-            {"項目": ["科目", "大項目", "対象回(分析対象の問題)", "上位N", "分析対象の中項目", "語の出題数の集計範囲"],
-             "内容": [subject, major, f"第{year_min}〜{year_max}回", str(top_n), "、".join(targets), "第1回〜第34回の全問題(同大項目／科目全体)"]}),
+            {"項目": ["科目", "大項目", "対象回(分析対象の問題)", "上位N", "分析対象の中項目", "語の出題数の集計範囲", "科目横断の判定", "比較期間"],
+             "内容": [subject, major, f"第{year_min}〜{year_max}回", str(top_n), "、".join(targets), "第1回〜第34回の全問題(同大項目／科目全体)", f"抽出語{len(freq_terms)}語が比較先の問題文・選択肢に含まれるか", "第1〜27回と第28〜34回"]}),
         "頻度ランキング": ranking,
-        "関連軸集計": axis_summary(tagged, d),
+        "関連軸集計": related_axis,
+        "科目横断集計": cross_summary,
+        "科目横断の年度推移": cross_yearly,
+        "科目横断の時期比較": cross_periods,
+        "科目横断該当問題": cross_questions,
+        "疾患・病態軸集計": axis_summary(tagged, d),
         "対象問題一覧": tagged[["中項目", "問題ID", "問題", *CHOICE_COLS, "模範解答", "正答", "関連軸", "重要語", "正答に含まれる重要語", "関連疾患", "図あり"]],
         "関連語句(全回集計)": freq_terms,
     }
