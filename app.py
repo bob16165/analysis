@@ -29,28 +29,39 @@ if not (freq_file and past_file):
     st.info("2つのExcelを指定してください。")
     st.stop()
 
-tab_run, tab_dict = st.tabs(["分析", "辞書の編集"])
+tab_run, tab_search, tab_dict = st.tabs(["分析", "語句検索", "辞書の編集"])
 
 with tab_run:
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     subject = c1.selectbox("科目", an.sheet_names(freq_file))
     freq, year_cols = an.load_freq(freq_file, subject)
     major = c2.selectbox("大項目", list(dict.fromkeys(freq["大項目"])))
     top_n = c3.number_input("上位N位まで（同順位は含む）", 1, 10, 3)
     y_lo, y_hi = c4.slider("分析対象の回", 1, 40, (28, 34))
-    min_hits = c5.number_input("頻出語の最低登場問題数", 1, 10, 2)
+    min_hits = c5.number_input("語の最低出題数(対象中項目・全回)", 1, 10, 2)
+    min_conc = c6.slider("大項目への集中度の下限", 0.0, 1.0, 0.5, 0.05,
+                         help="その語が出る全問題のうち、選択した大項目の問題が占める割合。下げるほど他領域にも出る語が増える")
 
     if st.button("分析する", type="primary"):
-        st.session_state["result"] = an.analyze(freq_file, past_file, subject, major, int(top_n), y_lo, y_hi, int(min_hits))
+        st.session_state["result"] = an.analyze(freq_file, past_file, subject, major, int(top_n), y_lo, y_hi, int(min_hits), float(min_conc))
 
     result = st.session_state.get("result")
     if result:
         for name, df in result.items():
             st.subheader(name)
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.dataframe(df, width="stretch", hide_index=True)
         c1, c2 = st.columns(2)
         c1.download_button("Excelをダウンロード", an.to_excel_bytes(result), "出題傾向分析.xlsx")
         c2.download_button("AIレポート用Markdown", an.to_markdown(result), "出題傾向分析.md")
+
+with tab_search:
+    st.caption("語句が問題文・選択肢に含まれる全問題(第1回〜)を、科目内で検索します。抽出漏れの確認用です。")
+    s_subject = st.selectbox("科目", an.sheet_names(past_file), key="s_subject")
+    word = st.text_input("語句")
+    if word:
+        hit = an.search_term(past_file, s_subject, word)
+        st.write(f"{len(hit)}問")
+        st.dataframe(hit, width="stretch", hide_index=True)
 
 with tab_dict:
     st.caption("除外語・軸の判定キーワード・重要語→関連疾患の対応(dictionary.json)と、分割したくない医療用語(medical_terms.txt)を編集できます。保存後に再分析してください。")

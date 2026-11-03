@@ -100,7 +100,7 @@ def save_medical_terms(text: str) -> None:
     MEDICAL_TERMS_PATH.write_text(text.strip() + "\n", encoding="utf-8")
 
 
-def analyze(freq_file, past_file, subject, major, top_n, year_min=28, year_max=34, min_hits=2):
+def analyze(freq_file, past_file, subject, major, top_n, year_min=28, year_max=34, min_hits=2, min_conc=0.5):
     freq, year_cols = load_freq(freq_file, subject)
     ranking = rank_middle(freq, year_cols, major, top_n)
     targets = ranking.loc[ranking["分析対象"], "中項目"].tolist()
@@ -113,9 +113,8 @@ def analyze(freq_file, past_file, subject, major, top_n, year_min=28, year_max=3
     # 選択した大項目・その中項目名と同一の語は分析対象外
     exact_stop = {terms.norm(w) for w in pd.concat([pd.Series([major]), freq.loc[freq["大項目"] == major, "中項目"]]).dropna().unique()}
     related = {terms.norm(k): v for k, v in d["重要語(疾患・所見)"].items()}
-    vocab = terms.build_vocab(all_q, load_medical_terms(), list(related), stop, exact_stop)
-    extract = terms.make_extractor(vocab, stop, exact_stop)
-    freq_terms = terms.frequent_terms(qs, all_q, extract, major, related, min_hits)
+    curated = load_medical_terms() + list(d["重要語(疾患・所見)"])
+    freq_terms = terms.related_terms(all_q, major, targets, curated, stop, exact_stop, related, min_hits, min_conc)
     return {
         "条件": pd.DataFrame(
             {"項目": ["科目", "大項目", "対象回(分析対象の問題)", "上位N", "分析対象の中項目", "語の出題数の集計範囲"],
@@ -123,8 +122,12 @@ def analyze(freq_file, past_file, subject, major, top_n, year_min=28, year_max=3
         "頻度ランキング": ranking,
         "関連軸集計": axis_summary(tagged, d),
         "対象問題一覧": tagged[["中項目", "問題ID", "問題", *CHOICE_COLS, "模範解答", "正答", "関連軸", "重要語", "正答に含まれる重要語", "関連疾患", "図あり"]],
-        "頻出語句(全回集計)": freq_terms,
+        "関連語句(全回集計)": freq_terms,
     }
+
+
+def search_term(past_file, subject, word):
+    return terms.search_term(load_questions(past_file, subject, 1, 999), word)
 
 
 def to_excel_bytes(result: dict) -> bytes:

@@ -1,4 +1,8 @@
-"""医療用語を分割せずに抽出し、全回(第1回〜)での出題回数を集計する。"""
+"""医療用語を分割せずに抽出し、大項目・中項目との関連の強さと全回での出題数を集計する。
+
+候補語は過去問全体の文字n-gramから作り(形態素解析に依存しない)、
+同じ出題数で長い語に含まれる断片(閉包でない語)を落とす。
+"""
 import re
 from collections import defaultdict
 
@@ -6,8 +10,9 @@ import pandas as pd
 
 CHOICE_IDX = "1234"
 _PAREN_LATIN = re.compile(r"[\(（][A-Za-z0-9\s\-'.,・/]+[\)）]")
-_DASH = re.compile(r"[―—─]{2,}")
-_TOKEN = re.compile(r"[一-龥ァ-ヶー・]{2,14}")
+_RUN = re.compile(r"[一-龥ァ-ヶー・]+")
+MAX_LEN = 12
+STEM, CORRECT, WRONG = 1, 2, 4
 
 
 def norm(x) -> str:
@@ -16,103 +21,136 @@ def norm(x) -> str:
     return re.sub(r"[\s　]", "", s)
 
 
-def _is_generic(term: str, stop: set[str]) -> bool:
+def is_generic(term: str, stop: set[str]) -> bool:
+    """除外語そのもの、または除外語だけで構成される語。"""
     if term in stop:
         return True
-    # 除外語だけで構成される語(例: 症状所見)も除く
     rest = term
     for s in sorted(stop, key=len, reverse=True):
         rest = rest.replace(s, "")
     return not rest
 
 
-def build_vocab(all_q: pd.DataFrame, curated: list[str], dict_terms: list[str], stop: set[str], exact_stop: set[str] = frozenset()) -> set[str]:
-    """医療用語の語彙。手動リスト＋辞書＋過去問の短い選択肢(それ自体が用語であることが多い)。"""
-    from collections import Counter
-
-    c = Counter()
-    for _, r in all_q.iterrows():
-        seen = set()
-        for i in CHOICE_IDX:
-            for part in _DASH.split(norm(r[f"選択肢{i}"])):
-                if 2 <= len(part) <= 16 and not re.search(r"[。、，,．.0-9０-９]", part) and re.search(r"[一-龥ァ-ヶ]", part):
-                    seen.add(part)
-        c.update(seen)
-    vocab = {t for t, n in c.items() if n >= 2}
-    vocab |= {norm(t) for t in curated + dict_terms + sorted(exact_stop) if norm(t)}
-    return {t for t in vocab if not _is_generic(t, stop)}
+def _grams(text: str) -> set[str]:
+    out = set()
+    for run in _RUN.findall(text):
+        n = len(run)
+        for i in range(n):
+            for j in range(i + 2, min(n, i + MAX_LEN) + 1):
+                g = run[i:j]
+                if g[0] in "ー・" or g[-1] == "・":
+                    continue
+                out.add(g)
+    return out
 
 
-def make_extractor(vocab: set[str], stop: set[str], exact_stop: set[str] = frozenset()):
-    ordered = sorted(vocab, key=len, reverse=True)
-    pat = re.compile("|".join(map(re.escape, ordered))) if ordered else None
-
-    def extract(text: str) -> set[str]:
-        found = set()
-        rest = text
-        if pat:
-            found = set(pat.findall(text))
-            rest = pat.sub("|", text)
-        for tok in _TOKEN.findall(rest):
-            if not _is_generic(tok, stop):
-                found.add(tok)
-        return {t for t in found if not _is_generic(t, stop) and t not in exact_stop}
-
-    return extract
-
-
-def _texts(r) -> dict:
+def question_texts(r) -> dict:
     ca = set(re.findall(r"\d", str(r["模範解答"])))
     return {
-        "stem": norm(r["問題"]),
-        "correct": [norm(r[f"選択肢{i}"]) for i in CHOICE_IDX if i in ca],
-        "wrong": [norm(r[f"選択肢{i}"]) for i in CHOICE_IDX if i not in ca],
+        STEM: [norm(r["問題"])],
+        CORRECT: [norm(r[f"選択肢{i}"]) for i in CHOICE_IDX if i in ca],
+        WRONG: [norm(r[f"選択肢{i}"]) for i in CHOICE_IDX if i not in ca],
     }
 
 
-def frequent_terms(target_q: pd.DataFrame, all_q: pd.DataFrame, extract, major: str,
-                   related: dict, min_hits: int = 2, top: int = 60) -> pd.DataFrame:
-    """対象問題で頻出する語を抽出し、同大項目・科目全体の全回での出題数を付ける。"""
-    hits = defaultdict(lambda: {"stem": set(), "correct": set(), "wrong": set()})
-    for _, r in target_q.iterrows():
-        t = _texts(r)
-        for w in extract(t["stem"]):
-            hits[w]["stem"].add(r["問題ID"])
-        for role in ("correct", "wrong"):
-            for s in t[role]:
-                for w in extract(s):
-                    hits[w][role].add(r["問題ID"])
-    cands = {w: v for w, v in hits.items() if len(v["stem"] | v["correct"] | v["wrong"]) >= min_hits}
+def build_index(all_q: pd.DataFrame, curated: list[str]):
+    """語 -> {行位置: 出現ビット(問題文/正答/誤答)}。curatedは平仮名を含む語も部分一致で追加。
+    あわせて、語が単独の語(平仮名・記号で区切られた連続部分そのもの)として出た問題の集合も返す。"""
+    idx = defaultdict(dict)
+    standalone = defaultdict(set)
+    cur = [norm(c) for c in curated if norm(c)]
+    for pos, (_, r) in enumerate(all_q.iterrows()):
+        for bit, texts in question_texts(r).items():
+            seen = set()
+            for t in texts:
+                seen |= _grams(t)
+                seen |= {c for c in cur if c in t}
+                for run in _RUN.findall(t):
+                    standalone[run].add(pos)
+            for g in seen:
+                idx[g][pos] = idx[g].get(pos, 0) | bit
+    return idx, standalone
 
-    pre = [(r, _texts(r)) for _, r in all_q.iterrows()]
+
+def closed_terms(idx: dict, min_df: int = 2) -> set[str]:
+    """出題数が同じ長い語に含まれる断片を除いた語集合。"""
+    df = {w: len(v) for w, v in idx.items() if len(v) >= min_df}
+    dropped = set()
+    for w, n in df.items():
+        for sub in (w[1:], w[:-1]):
+            if len(sub) >= 2 and df.get(sub) == n:
+                dropped.add(sub)
+    # 平仮名を含む語(手動登録語)に含まれる断片も除く
+    for w in [w for w in df if not _RUN.fullmatch(w)]:
+        n = df[w]
+        for g in df:
+            if g != w and len(g) < len(w) and g in w and df[g] == n:
+                dropped.add(g)
+    return set(df) - dropped
+
+
+def related_terms(all_q: pd.DataFrame, major: str, targets: list[str], curated: list[str],
+                  stop: set[str], exact_stop: set[str], related: dict,
+                  min_hits: int = 2, min_conc: float = 0.5, top: int = 100) -> pd.DataFrame:
+    """対象中項目に出る語のうち、大項目・中項目との関連が強いものを出題数つきで返す。"""
+    all_q = all_q.reset_index(drop=True)
+    idx, standalone = build_index(all_q, curated)
+    cand = closed_terms(idx)
+    cur = {norm(c) for c in curated}
+    in_major = (all_q["大項目"] == major).to_numpy()
+    in_target = (in_major & all_q["中項目"].isin(targets)).to_numpy()
+    kai = all_q["回"].to_numpy()
+    mid = all_q["中項目"].to_numpy()
     rows = []
-    for w, v in cands.items():
-        tq = v["stem"] | v["correct"] | v["wrong"]
-        stat = {"同": defaultdict(set), "全": defaultdict(set)}
-        for r, t in pre:
-            inq = w in t["stem"] or any(w in s for s in t["correct"] + t["wrong"])
-            if not inq:
-                continue
-            role = "正答" if any(w in s for s in t["correct"]) else "他"
-            for scope in ("全", "同") if r["大項目"] == major else ("全",):
-                stat[scope]["all"].add(r["問題ID"])
-                if r["回"] <= 27:
-                    stat[scope]["old"].add(r["問題ID"])
-                else:
-                    stat[scope]["new"].add(r["問題ID"])
-                if role == "正答":
-                    stat[scope]["ans"].add(r["問題ID"])
-                stat[scope]["years"].add(int(r["回"]))
-        s, a = stat["同"], stat["全"]
-        years = sorted(s["years"])
-        rows.append([
-            w, related.get(w, ""), len(tq), len(v["stem"]), len(v["correct"]), len(v["wrong"]),
-            len(s["all"]), len(s["old"]), len(s["new"]), len(s["ans"]), len(years),
-            "、".join(map(str, years)), len(a["all"]), len(a["old"]), len(a["new"]),
-        ])
-    cols = ["語", "関連疾患", "対象問題での登場数", "問題文", "正答選択肢", "誤答選択肢",
-            f"{major}・全回の出題数", "うち第1〜27回", "うち第28〜34回", "うち正答として", "出題された回の数", "出題された回",
-            "科目全体・全回の出題数", "科目全体 第1〜27回", "科目全体 第28〜34回"]
+    for w in cand:
+        if w in exact_stop or is_generic(w, stop):
+            continue
+        d = idx[w]
+        n_all = len(d)
+        # 断片(例:「パー」「骨神経」)を避けるため、単独の語として出る割合が半分以上の語だけ採用
+        if w not in cur and len(standalone.get(w, ())) < 0.5 * n_all:
+            continue
+        pm = [p for p in d if in_major[p]]
+        pt = [p for p in d if in_target[p]]
+        if len(pt) < min_hits:
+            continue
+        conc_major = len(pm) / n_all
+        if conc_major < min_conc:
+            continue
+        years = sorted({int(kai[p]) for p in pm})
+        by_mid = pd.Series([mid[p] for p in pm]).value_counts()
+        rows.append({
+            "語": w,
+            "関連疾患": related.get(w, ""),
+            "対象中項目での出題数(全回)": len(pt),
+            "対象中項目での集中度": round(len(pt) / n_all, 2),
+            "大項目内の出題数(全回)": len(pm),
+            "大項目での集中度": round(conc_major, 2),
+            "最も多い中項目": f"{by_mid.index[0]}({by_mid.iloc[0]})",
+            "うち第1〜27回": sum(1 for p in pm if kai[p] <= 27),
+            "うち第28〜34回": sum(1 for p in pm if kai[p] >= 28),
+            "うち正答として": sum(1 for p in pm if d[p] & CORRECT),
+            "出題された回の数": len(years),
+            "出題された回": "、".join(map(str, years)),
+            "科目全体の出題数(全回)": n_all,
+        })
+    cols = ["語", "関連疾患", "対象中項目での出題数(全回)", "対象中項目での集中度", "大項目内の出題数(全回)",
+            "大項目での集中度", "最も多い中項目", "うち第1〜27回", "うち第28〜34回", "うち正答として",
+            "出題された回の数", "出題された回", "科目全体の出題数(全回)"]
     df = pd.DataFrame(rows, columns=cols)
-    df = df.sort_values(["対象問題での登場数", f"{major}・全回の出題数"], ascending=False, kind="stable")
+    df = df.sort_values(["対象中項目での出題数(全回)", "対象中項目での集中度", "大項目内の出題数(全回)"],
+                        ascending=False, kind="stable")
     return df.head(top).reset_index(drop=True)
+
+
+def search_term(all_q: pd.DataFrame, word: str) -> pd.DataFrame:
+    """語句が問題文・選択肢に含まれる全問題を返す(検証用)。"""
+    w = norm(word)
+    rows = []
+    for _, r in all_q.iterrows():
+        t = question_texts(r)
+        roles = [name for bit, name in ((STEM, "問題文"), (CORRECT, "正答"), (WRONG, "誤答"))
+                 if any(w in x for x in t[bit])]
+        if roles:
+            rows.append([r["問題ID"], r["大項目"], r["中項目"], "・".join(roles), r["問題"]])
+    return pd.DataFrame(rows, columns=["問題ID", "大項目", "中項目", "登場箇所", "問題"])
