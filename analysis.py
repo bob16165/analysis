@@ -10,9 +10,6 @@ import terms
 DICT_PATH = Path(__file__).parent / "dictionary.json"
 CHOICE_COLS = ["選択肢1", "選択肢2", "選択肢3", "選択肢4"]
 RELATED_AXIS_SUBJECTS = ["リハ医学", "一般臨床", "整形外科", "柔道整復学"]
-CROSS_SUBJECTS = [
-    "運動学", "病理学", "リハ医学", "一般臨床", "外科学", "整形外科", "柔道整復学"
-]
 SUBJECT_LABELS = {"柔道整復学": "柔整理論"}
 
 
@@ -95,7 +92,7 @@ def axis_summary(tagged: pd.DataFrame, d: dict) -> pd.DataFrame:
 def cross_subject_analysis(question_sheets: dict[str, pd.DataFrame], source_subject: str,
                            extracted_terms: pd.DataFrame, subjects=None) -> tuple:
     """集計した語句が他科目の問題に現れる割合と、該当問題を返す。"""
-    subject_list = CROSS_SUBJECTS if subjects is None else subjects
+    subject_list = list(question_sheets) if subjects is None else subjects
     words = []
     if "語" in extracted_terms:
         words = [(str(word), norm(word)) for word in extracted_terms["語"] if norm(word)]
@@ -156,7 +153,7 @@ def cross_subject_analysis(question_sheets: dict[str, pd.DataFrame], source_subj
                 "一致率(%)": round(year_hits / year_total * 100, 1),
             })
 
-        for period, low, high in (("第1〜27回", 1, 27), ("第28〜34回", 28, 34)):
+        for period, low, high in (("第1〜24回", 1, 24), ("第25〜34回(直近10年)", 25, 34)):
             period_total = sum(
                 counts[0] for year, counts in matched_by_year.items() if low <= year <= high
             )
@@ -198,7 +195,7 @@ def save_medical_terms(text: str) -> None:
     MEDICAL_TERMS_PATH.write_text(text.strip() + "\n", encoding="utf-8")
 
 
-def analyze(freq_file, past_file, subject, major, top_n, year_min=28, year_max=34, min_hits=2, min_conc=0.5):
+def analyze(freq_file, past_file, subject, major, top_n, year_min=25, year_max=34, min_hits=2, min_conc=0.5):
     freq, year_cols = load_freq(freq_file, subject)
     ranking = rank_middle(freq, year_cols, major, top_n)
     targets = ranking.loc[ranking["分析対象"], "中項目"].tolist()
@@ -226,7 +223,7 @@ def analyze(freq_file, past_file, subject, major, top_n, year_min=28, year_max=3
     return {
         "条件": pd.DataFrame(
             {"項目": ["科目", "大項目", "対象回(分析対象の問題)", "上位N", "分析対象の中項目", "語の出題数の集計範囲", "科目横断の判定", "比較期間"],
-             "内容": [subject, major, f"第{year_min}〜{year_max}回", str(top_n), "、".join(targets), "第1回〜第34回の全問題(同大項目／科目全体)", f"抽出語{len(freq_terms)}語が比較先の問題文・選択肢に含まれるか", "第1〜27回と第28〜34回"]}),
+             "内容": [subject, major, f"第{year_min}〜{year_max}回", str(top_n), "、".join(targets), "第1回〜第34回の全問題(同大項目／科目全体)", f"抽出語{len(freq_terms)}語が比較先の問題文・選択肢に含まれるか", "第1〜24回と第25〜34回(直近10年)"]}),
         "頻度ランキング": ranking,
         "関連軸集計": related_axis,
         "科目横断集計": cross_summary,
@@ -241,6 +238,18 @@ def analyze(freq_file, past_file, subject, major, top_n, year_min=28, year_max=3
 
 def search_term(past_file, subject, word):
     return terms.search_term(load_questions(past_file, subject, 1, 999), word)
+
+
+def diagnose_term(freq_file, past_file, subject, major, top_n, word, min_hits=2, min_conc=0.5):
+    freq, year_cols = load_freq(freq_file, subject)
+    ranking = rank_middle(freq, year_cols, major, top_n)
+    targets = ranking.loc[ranking["分析対象"], "中項目"].tolist()
+    d = load_dictionary()
+    all_q = load_questions(past_file, subject, 1, 999)
+    stop = {terms.norm(w) for w in d.get("除外語", [])}
+    exact_stop = {terms.norm(w) for w in pd.concat([pd.Series([major]), freq.loc[freq["大項目"] == major, "中項目"]]).dropna().unique()}
+    curated = load_medical_terms() + list(d["重要語(疾患・所見)"])
+    return terms.diagnose_term(all_q, word, major, targets, curated, stop, exact_stop, min_hits, min_conc)
 
 
 def to_excel_bytes(result: dict) -> bytes:

@@ -12,6 +12,7 @@ CHOICE_IDX = "1234"
 _PAREN_LATIN = re.compile(r"[\(（][A-Za-z0-9\s\-'.,・/]+[\)）]")
 _RUN = re.compile(r"[一-龥ァ-ヶー・]+")
 MAX_LEN = 12
+RECENT_MIN = 25  # 中項目が付与されている第25〜34回(直近10年)。第1〜24回は大項目のみ
 STEM, CORRECT, WRONG = 1, 2, 4
 
 
@@ -127,15 +128,15 @@ def related_terms(all_q: pd.DataFrame, major: str, targets: list[str], curated: 
             "大項目内の出題数(全回)": len(pm),
             "大項目での集中度": round(conc_major, 2),
             "最も多い中項目": f"{by_mid.index[0]}({by_mid.iloc[0]})",
-            "うち第1〜27回": sum(1 for p in pm if kai[p] <= 27),
-            "うち第28〜34回": sum(1 for p in pm if kai[p] >= 28),
+            "うち第1〜24回": sum(1 for p in pm if kai[p] < RECENT_MIN),
+            "うち第25〜34回(直近10年)": sum(1 for p in pm if kai[p] >= RECENT_MIN),
             "うち正答として": sum(1 for p in pm if d[p] & CORRECT),
             "出題された回の数": len(years),
             "出題された回": "、".join(map(str, years)),
             "科目全体の出題数(全回)": n_all,
         })
     cols = ["語", "関連疾患", "対象中項目での出題数(全回)", "対象中項目での集中度", "大項目内の出題数(全回)",
-            "大項目での集中度", "最も多い中項目", "うち第1〜27回", "うち第28〜34回", "うち正答として",
+            "大項目での集中度", "最も多い中項目", "うち第1〜24回", "うち第25〜34回(直近10年)", "うち正答として",
             "出題された回の数", "出題された回", "科目全体の出題数(全回)"]
     df = pd.DataFrame(rows, columns=cols)
     df = df.sort_values(["対象中項目での出題数(全回)", "対象中項目での集中度", "大項目内の出題数(全回)"],
@@ -154,3 +155,31 @@ def search_term(all_q: pd.DataFrame, word: str) -> pd.DataFrame:
         if roles:
             rows.append([r["問題ID"], r["大項目"], r["中項目"], "・".join(roles), r["問題"]])
     return pd.DataFrame(rows, columns=["問題ID", "大項目", "中項目", "登場箇所", "問題"])
+
+
+def diagnose_term(all_q: pd.DataFrame, word: str, major: str, targets: list[str], curated: list[str],
+                  stop: set[str], exact_stop: set[str], min_hits: int = 2, min_conc: float = 0.5) -> list[str]:
+    """語が抽出表に出ない理由を返す(手作業で見つけた語との差の確認用)。"""
+    w = norm(word)
+    all_q = all_q.reset_index(drop=True)
+    idx, standalone = build_index(all_q, curated)
+    d = idx.get(w, {})
+    if not d:
+        return ["過去問(問題文・選択肢)に出現しない(表記ゆれ・括弧内の英語表記の除去・全角半角を確認)"]
+    reasons = []
+    if w in exact_stop or is_generic(w, stop):
+        reasons.append("除外語または大項目/中項目名と同一のため除外")
+    if w not in closed_terms(idx):
+        reasons.append("出題数が同じ、より長い語の断片として扱われ除外(長い語の方で抽出されている可能性)")
+    cur = {norm(c) for c in curated}
+    if w not in cur and len(standalone.get(w, ())) < 0.5 * len(d):
+        reasons.append("単独の語としての出現が半分未満(断片扱い)。medical_terms.txtへの登録で解消")
+    in_major = (all_q["大項目"] == major).to_numpy()
+    in_target = in_major & all_q["中項目"].isin(targets).to_numpy()
+    n_t = sum(1 for p in d if in_target[p])
+    n_m = sum(1 for p in d if in_major[p])
+    if n_t < min_hits:
+        reasons.append(f"対象中項目での出題数が{n_t}問で下限{min_hits}未満")
+    if n_m / len(d) < min_conc:
+        reasons.append(f"大項目への集中度が{n_m / len(d):.2f}で下限{min_conc}未満(他の大項目でも多く出る語)")
+    return reasons or ["条件は満たす。上位100件の表示件数で切れている可能性"]

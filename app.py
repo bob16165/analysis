@@ -37,7 +37,7 @@ with tab_run:
     freq, year_cols = an.load_freq(freq_file, subject)
     major = c2.selectbox("大項目", list(dict.fromkeys(freq["大項目"])))
     top_n = c3.number_input("上位N位まで（同順位は含む）", 1, 10, 3)
-    y_lo, y_hi = c4.slider("分析対象の回", 1, 40, (28, 34))
+    y_lo, y_hi = c4.slider("分析対象の回", 1, 40, (25, 34))
     min_hits = c5.number_input("語の最低出題数(対象中項目・全回)", 1, 10, 2)
     min_conc = c6.slider("大項目への集中度の下限", 0.0, 1.0, 0.5, 0.05,
                          help="その語が出る全問題のうち、選択した大項目の問題が占める割合。下げるほど他領域にも出る語が増える")
@@ -67,7 +67,12 @@ with tab_search:
     word = st.text_input("語句")
     if word:
         hit = an.search_term(past_file, s_subject, word)
-        st.write(f"{len(hit)}問")
+        yrs = hit["問題ID"].str.extract(r"第(\d+)回")[0].astype(float)
+        st.write(f"{len(hit)}問(第1〜24回: {int((yrs <= 24).sum())}問 / 第25〜34回: {int((yrs >= 25).sum())}問)")
+        if "result" in st.session_state:
+            st.write("**抽出表に出ない理由(上で選択中の科目・大項目・条件で判定)**")
+            for reason in an.diagnose_term(freq_file, past_file, subject, major, int(top_n), word, int(min_hits), float(min_conc)):
+                st.write("- " + reason)
         st.dataframe(hit, width="stretch", hide_index=True)
 
 with tab_dict:
