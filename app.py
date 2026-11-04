@@ -52,11 +52,57 @@ with tab_run:
 
     result = st.session_state.get("result")
     if result:
-        for name, df in result.items():
-            st.subheader(name)
-            st.dataframe(df, width="stretch", hide_index=True)
-            if name == "科目横断の年度推移" and not df.empty:
-                st.line_chart(df.pivot(index="回", columns="科目", values="一致率(%)"))
+        article_summary = result["記事向け要約"].iloc[0]
+        st.subheader("記事の骨子")
+        metric_columns = st.columns(4)
+        metric_columns[0].metric(
+            "対象中項目の出題数",
+            f"{article_summary['対象問題数']} / {article_summary['大項目の問題数']}",
+        )
+        share = article_summary["大項目内割合(%)"]
+        metric_columns[1].metric(
+            "大項目内の割合",
+            f"{share}%" if article_summary["大項目の問題数"] else "—",
+        )
+        metric_columns[2].metric(
+            "対象が出題された回数",
+            f"{article_summary['対象が出題された回数']} / {article_summary['集計可能回数']}",
+        )
+        metric_columns[3].metric("対象中項目数", article_summary["対象中項目数"])
+        st.caption(
+            f"{article_summary['科目']} / {article_summary['大項目']} / "
+            f"{article_summary['分析対象回']}。割合は各回の大項目の問題数を分母にしています。"
+        )
+        if not article_summary["大項目の問題数"]:
+            st.warning("選択した期間にこの大項目の過去問がないため、割合を算出できません。")
+
+        st.subheader("中項目別の出題状況")
+        st.dataframe(result["中項目別の出題状況"], width="stretch", hide_index=True)
+        st.subheader("対象中項目の年度推移")
+        trend = result["対象中項目の年度推移"]
+        st.line_chart(trend.set_index("回")["大項目内割合(%)"])
+        st.dataframe(trend, width="stretch", hide_index=True)
+        with st.expander("記事で確認する問題例（各中項目の直近回から自動選定）"):
+            st.caption("記事へ掲載する前に、問題文・正答・集計条件を原資料で確認してください。")
+            st.dataframe(result["記事向け問題例"], width="stretch", hide_index=True)
+
+        st.info(
+            "出題割合は過去問の記述値で、将来の出題予測ではありません。"
+            "科目横断は抽出語句の一致を数えた指標であり、複数科目の知識が必要な問題とは限りません。"
+        )
+
+        article_keys = {
+            "記事向け要約", "中項目別の出題状況", "対象中項目の年度推移",
+            "記事向け問題例", "解釈上の注意",
+        }
+        with st.expander("詳細データ（全表）"):
+            for name, df in result.items():
+                if name in article_keys:
+                    continue
+                st.subheader(name)
+                st.dataframe(df, width="stretch", hide_index=True)
+                if name == "科目横断の年度推移" and not df.empty:
+                    st.line_chart(df.pivot(index="回", columns="科目", values="一致率(%)"))
         c1, c2 = st.columns(2)
         c1.download_button("Excelをダウンロード", an.to_excel_bytes(result), "出題傾向分析.xlsx")
         c2.download_button("AIレポート用Markdown", an.to_markdown(result), "出題傾向分析.md")

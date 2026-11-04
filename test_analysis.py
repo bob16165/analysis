@@ -56,5 +56,63 @@ class CrossSubjectAnalysisTests(unittest.TestCase):
         self.assertTrue(matches.empty)
 
 
+class ArticleTableTests(unittest.TestCase):
+    def test_empty_question_selection_keeps_tag_columns(self):
+        questions = pd.DataFrame(columns=["問題", "選択肢1", "選択肢2", "選択肢3", "選択肢4", "正答"])
+
+        tagged = analysis.tag_questions(questions, {"疾患・病態の軸": {}, "重要語(疾患・所見)": {}})
+
+        self.assertIn("関連軸", tagged.columns)
+        self.assertIn("正答に含まれる重要語", tagged.columns)
+        self.assertTrue(tagged.empty)
+
+    def test_missing_major_questions_leave_shares_unavailable(self):
+        questions = pd.DataFrame(columns=["大項目", "中項目", "回"])
+
+        summary, topics, trend, examples = analysis.article_tables(
+            questions, pd.DataFrame(), "整形外科", "骨折", ["A"], 25, 26,
+        )
+
+        self.assertTrue(pd.isna(summary.loc[0, "大項目内割合(%)"]))
+        self.assertTrue(pd.isna(topics.loc[0, "大項目内割合(%)"]))
+        self.assertTrue(trend["大項目内割合(%)"].isna().all())
+        self.assertTrue(examples.empty)
+
+    def test_summarizes_denominators_recurrence_trend_and_latest_examples(self):
+        questions = pd.DataFrame([
+            {"大項目": "骨折", "中項目": "A", "回": 25},
+            {"大項目": "骨折", "中項目": "他", "回": 25},
+            {"大項目": "骨折", "中項目": "A", "回": 26},
+            {"大項目": "骨折", "中項目": "他", "回": 27},
+        ])
+        tagged = pd.DataFrame([
+            {
+                "中項目": "A", "問題番号": 1, "問題ID": "第25回No.1", "回": 25,
+                "問題": "古い問題", "選択肢1": "a", "選択肢2": "b",
+                "選択肢3": "c", "選択肢4": "d", "模範解答": "1", "正答": "a",
+                "関連軸": "", "重要語": "", "正答に含まれる重要語": "", "関連疾患": "",
+            },
+            {
+                "中項目": "A", "問題番号": 2, "問題ID": "第26回No.2", "回": 26,
+                "問題": "新しい問題", "選択肢1": "e", "選択肢2": "f",
+                "選択肢3": "g", "選択肢4": "h", "模範解答": "1", "正答": "e",
+                "関連軸": "", "重要語": "", "正答に含まれる重要語": "", "関連疾患": "",
+            },
+        ])
+
+        summary, topics, trend, examples = analysis.article_tables(
+            questions, tagged, "整形外科", "骨折", ["A", "B"], 25, 27,
+        )
+
+        self.assertEqual(summary.loc[0, "対象問題数"], 2)
+        self.assertEqual(summary.loc[0, "大項目の問題数"], 4)
+        self.assertEqual(summary.loc[0, "大項目内割合(%)"], 50.0)
+        self.assertEqual(summary.loc[0, "対象が出題された回数"], 2)
+        self.assertEqual(topics["対象期間出題数"].tolist(), [2, 0])
+        self.assertEqual(topics["出題回数"].tolist(), [2, 0])
+        self.assertEqual(trend["大項目内割合(%)"].tolist(), [50.0, 100.0, 0.0])
+        self.assertEqual(examples["問題"].tolist(), ["新しい問題"])
+
+
 if __name__ == "__main__":
     unittest.main()

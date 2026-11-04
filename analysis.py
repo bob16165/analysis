@@ -77,7 +77,12 @@ def tag_question(r: pd.Series, d: dict) -> dict:
 
 
 def tag_questions(qs: pd.DataFrame, d: dict) -> pd.DataFrame:
-    tags = pd.DataFrame([tag_question(r, d) for _, r in qs.iterrows()], index=qs.index)
+    tag_columns = ["関連軸", "重要語", "正答に含まれる重要語", "関連疾患", "図あり"]
+    tags = pd.DataFrame(
+        [tag_question(r, d) for _, r in qs.iterrows()],
+        index=qs.index,
+        columns=tag_columns,
+    )
     return pd.concat([qs, tags], axis=1)
 
 
@@ -87,6 +92,74 @@ def axis_summary(tagged: pd.DataFrame, d: dict) -> pd.DataFrame:
         hit = tagged[tagged["関連軸"].str.contains(ax, na=False)]
         rows.append([ax, len(hit), "、".join(hit["問題ID"])])
     return pd.DataFrame(rows, columns=["関連軸", "問題数", "該当問題"])
+
+
+def article_tables(questions: pd.DataFrame, tagged: pd.DataFrame, subject: str,
+                   major: str, targets: list[str], year_min: int, year_max: int) -> tuple:
+    major_questions = questions[
+        questions["大項目"].eq(major) & questions["回"].between(year_min, year_max)
+    ]
+    target_questions = major_questions[major_questions["中項目"].isin(targets)]
+    years = list(range(year_min, year_max + 1))
+    major_counts = major_questions.groupby("回").size().reindex(years, fill_value=0)
+    target_counts = target_questions.groupby("回").size().reindex(years, fill_value=0)
+    measurable_years = int((major_counts > 0).sum())
+
+    summary = pd.DataFrame([{
+        "科目": subject,
+        "大項目": major,
+        "分析対象回": f"第{year_min}〜{year_max}回",
+        "対象中項目数": len(targets),
+        "対象問題数": len(target_questions),
+        "大項目の問題数": len(major_questions),
+        "大項目内割合(%)": round(len(target_questions) / len(major_questions) * 100, 1)
+        if len(major_questions) else None,
+        "対象が出題された回数": int((target_counts > 0).sum()),
+        "集計可能回数": measurable_years,
+    }])
+
+    topic_rows = []
+    for topic in targets:
+        topic_questions = target_questions[target_questions["中項目"].eq(topic)]
+        topic_rows.append({
+            "中項目": topic,
+            "対象期間出題数": len(topic_questions),
+            "出題回数": int(topic_questions["回"].nunique()),
+            "大項目内割合(%)": round(len(topic_questions) / len(major_questions) * 100, 1)
+            if len(major_questions) else None,
+        })
+    topics = pd.DataFrame(topic_rows, columns=[
+        "中項目", "対象期間出題数", "出題回数", "大項目内割合(%)"
+    ])
+
+    trend = pd.DataFrame({
+        "回": years,
+        "対象中項目の問題数": target_counts.to_numpy(),
+        "大項目の問題数": major_counts.to_numpy(),
+    })
+    trend["大項目内割合(%)"] = trend.apply(
+        lambda row: round(row["対象中項目の問題数"] / row["大項目の問題数"] * 100, 1)
+        if row["大項目の問題数"] else None,
+        axis=1,
+    )
+
+    example_columns = [
+        "中項目", "問題ID", "問題", *CHOICE_COLS, "模範解答", "正答",
+        "関連軸", "重要語", "正答に含まれる重要語", "関連疾患",
+    ]
+    if tagged.empty:
+        examples = pd.DataFrame(columns=example_columns)
+    else:
+        ordered = tagged.assign(
+            _question_number=pd.to_numeric(tagged["問題番号"], errors="coerce")
+        ).sort_values(
+            ["中項目", "回", "_question_number"],
+            ascending=[True, False, True],
+            kind="stable",
+        )
+        examples = ordered.drop_duplicates("中項目")[example_columns].reset_index(drop=True)
+
+    return summary, topics, trend, examples
 
 
 def cross_subject_analysis(question_sheets: dict[str, pd.DataFrame], source_subject: str,
@@ -208,6 +281,9 @@ def analyze(freq_file, past_file, subject, major, top_n, year_min=25, year_max=3
     all_q = question_sheets[subject]
     qs = all_q[(all_q["大項目"] == major) & all_q["中項目"].isin(targets) & all_q["回"].between(year_min, year_max)]
     tagged = tag_questions(qs, d).sort_values(["中項目", "回", "問題ID"])
+    article_summary, article_topics, article_trend, article_examples = article_tables(
+        all_q, tagged, subject, major, targets, year_min, year_max
+    )
     stop = {terms.norm(w) for w in d.get("除外語", [])}
     # 選択した大項目・その中項目名と同一の語は分析対象外
     exact_stop = {terms.norm(w) for w in pd.concat([pd.Series([major]), freq.loc[freq["大項目"] == major, "中項目"]]).dropna().unique()}
@@ -224,6 +300,15 @@ def analyze(freq_file, past_file, subject, major, top_n, year_min=25, year_max=3
         "条件": pd.DataFrame(
             {"項目": ["科目", "大項目", "対象回(分析対象の問題)", "上位N", "分析対象の中項目", "語の出題数の集計範囲", "科目横断の判定", "比較期間"],
              "内容": [subject, major, f"第{year_min}〜{year_max}回", str(top_n), "、".join(targets), "第1回〜第34回の全問題(同大項目／科目全体)", f"抽出語{len(freq_terms)}語が比較先の問題文・選択肢に含まれるか", "第1〜24回と第25〜34回(直近10年)"]}),
+        "記事向け要約": article_summary,
+        "中項目別の出題状況": article_topics,
+        "対象中項目の年度推移": article_trend,
+        "記事向け問題例": article_examples,
+        "解釈上の注意": pd.DataFrame({"内容": [
+            "出題数・割合は指定期間の過去問を集計した記述値であり、将来の出題を予測するものではありません。",
+            "科目横断は抽出語句が問題文・選択肢に現れるかを数えた指標です。複数科目の知識が必要な問題だとは判定しません。",
+            "問題例は対象中項目ごとに指定期間内の直近回から自動選定しています。記事に掲載する前に問題文・正答・集計条件を確認してください。",
+        ]}),
         "頻度ランキング": ranking,
         "関連軸集計": related_axis,
         "科目横断集計": cross_summary,
