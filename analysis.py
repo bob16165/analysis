@@ -162,6 +162,24 @@ def article_tables(questions: pd.DataFrame, tagged: pd.DataFrame, subject: str,
     return summary, topics, trend, examples
 
 
+def article_topic_trend(questions: pd.DataFrame, major: str, targets: list[str],
+                        year_min: int, year_max: int) -> pd.DataFrame:
+    major_questions = questions[
+        questions["大項目"].eq(major) & questions["回"].between(year_min, year_max)
+    ]
+    rows = []
+    for year in range(year_min, year_max + 1):
+        year_questions = major_questions[major_questions["回"].eq(year)]
+        for topic in targets:
+            rows.append({
+                "回": year,
+                "中項目": topic,
+                "問題数": int(year_questions["中項目"].eq(topic).sum()),
+                "大項目の問題数": len(year_questions),
+            })
+    return pd.DataFrame(rows, columns=["回", "中項目", "問題数", "大項目の問題数"])
+
+
 def cross_subject_analysis(question_sheets: dict[str, pd.DataFrame], source_subject: str,
                            extracted_terms: pd.DataFrame, subjects=None) -> tuple:
     """集計した語句が他科目の問題に現れる割合と、該当問題を返す。"""
@@ -290,6 +308,7 @@ def analyze(freq_file, past_file, subject, major, top_n, year_min=25, year_max=3
     related = {terms.norm(k): v for k, v in d["重要語(疾患・所見)"].items()}
     curated = load_medical_terms() + list(d["重要語(疾患・所見)"])
     freq_terms = terms.related_terms(all_q, major, targets, curated, stop, exact_stop, related, min_hits, min_conc)
+    topic_terms = terms.topic_frequent_terms(qs, targets, curated, stop, exact_stop)
     cross_summary, cross_yearly, cross_periods, cross_questions = cross_subject_analysis(
         question_sheets, subject, freq_terms
     )
@@ -303,11 +322,14 @@ def analyze(freq_file, past_file, subject, major, top_n, year_min=25, year_max=3
         "記事向け要約": article_summary,
         "中項目別の出題状況": article_topics,
         "対象中項目の年度推移": article_trend,
+        "中項目別の年度推移": article_topic_trend(all_q, major, targets, year_min, year_max),
+        "中項目別の頻出語": topic_terms,
         "記事向け問題例": article_examples,
         "解釈上の注意": pd.DataFrame({"内容": [
             "出題数・割合は指定期間の過去問を集計した記述値であり、将来の出題を予測するものではありません。",
             "科目横断は抽出語句が問題文・選択肢に現れるかを数えた指標です。複数科目の知識が必要な問題だとは判定しません。",
             "問題例は対象中項目ごとに指定期間内の直近回から自動選定しています。記事に掲載する前に問題文・正答・集計条件を確認してください。",
+            "中項目別の頻出語は選択期間内の問題文・選択肢に2問以上出現した抽出候補です。表記を正規化し、同じ問題内の繰り返しは1問と数えます。誤答の選択肢も含むため、正答や主題とは限りません。",
         ]}),
         "頻度ランキング": ranking,
         "関連軸集計": related_axis,

@@ -144,6 +144,45 @@ def related_terms(all_q: pd.DataFrame, major: str, targets: list[str], curated: 
     return df.head(top).reset_index(drop=True)
 
 
+def topic_frequent_terms(questions: pd.DataFrame, targets: list[str], curated: list[str],
+                         stop: set[str], exact_stop: set[str], top: int = 3) -> pd.DataFrame:
+    """対象期間の中項目ごとに、少なくとも2問に現れる候補語を集計する。"""
+    columns = ["中項目", "順位", "語", "出現問題数", "対象問題数", "問題ID"]
+    questions = questions.reset_index(drop=True)
+    if questions.empty:
+        return pd.DataFrame(columns=columns)
+    idx, standalone = build_index(questions, curated)
+    curated_set = {norm(word) for word in curated}
+    rows = []
+    for topic in targets:
+        positions = set(questions.index[questions["中項目"].eq(topic)])
+        if not positions:
+            continue
+        topic_index = {
+            word: {pos: bits for pos, bits in occurrences.items() if pos in positions}
+            for word, occurrences in idx.items()
+        }
+        candidates = closed_terms(topic_index, min_df=2)
+        candidates = [
+            word for word in candidates
+            if word not in exact_stop and not is_generic(word, stop)
+            and (word in curated_set or
+                 len(standalone.get(word, set()) & positions) >= len(topic_index[word]) * 0.5)
+        ]
+        candidates.sort(key=lambda word: (-len(topic_index[word]), word))
+        for rank, word in enumerate(candidates[:top], 1):
+            matches = sorted(topic_index[word])
+            rows.append({
+                "中項目": topic,
+                "順位": rank,
+                "語": word,
+                "出現問題数": len(matches),
+                "対象問題数": len(positions),
+                "問題ID": "、".join(str(questions.iloc[pos]["問題ID"]) for pos in matches),
+            })
+    return pd.DataFrame(rows, columns=columns)
+
+
 def search_term(all_q: pd.DataFrame, word: str) -> pd.DataFrame:
     """語句が問題文・選択肢に含まれる全問題を返す(検証用)。"""
     w = norm(word)
