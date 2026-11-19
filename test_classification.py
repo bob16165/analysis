@@ -1,8 +1,10 @@
+import io
 import json
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -61,6 +63,39 @@ class ClassificationTests(unittest.TestCase):
             "taxonomy": taxonomy,
             "taxonomy_rationale": "正答に必要な認知処理を確認した。",
             "taxonomy_status": "人間確認済み",
+        }
+
+    def _ollama_candidate(self):
+        return {
+            "formats": {
+                "臨床状況・症例提示": {
+                    "value": "該当",
+                    "evidence": "患者",
+                    "rationale": "患者情報が提示されている。",
+                },
+                "組合せ問題": {
+                    "value": "該当",
+                    "evidence": "組合せ",
+                    "rationale": "組合せを選ぶ形式である。",
+                },
+                "計算問題": {
+                    "value": "判定保留",
+                    "evidence": "",
+                    "rationale": "実計算が必要か確認できない。",
+                },
+                "その他": {
+                    "value": "判定保留",
+                    "evidence": "",
+                    "rationale": "特殊形式の根拠がない。",
+                },
+            },
+            "taxonomy": {
+                "value": "Ⅱ型",
+                "evidence": "橈骨",
+                "rationale": "提示情報を解釈して判断する。",
+            },
+            "model": "qwen2.5:latest",
+            "prompt_version": classification.OLLAMA_PROMPT_VERSION,
         }
 
     def test_rule_batches_are_explicit_and_candidates_remain_provisional(self):
@@ -256,6 +291,147 @@ class ClassificationTests(unittest.TestCase):
                 self.database_path, problem_id
             )["rule_status"],
             "完了",
+        )
+
+    def test_ollama_output_requires_grounded_evidence_and_loopback_url(self):
+        question_record = classification._make_record(
+            pd.Series(question_row(1, "橈骨の名称はどれか。")), "解剖学"
+        )
+        question = json.loads(question_record["question_json"])
+        response = self._ollama_candidate()
+        parsed = classification._parse_ollama_result(
+            json.dumps(response, ensure_ascii=False), question, "qwen2.5:latest"
+        )
+        self.assertEqual(parsed["taxonomy"]["value"], "Ⅱ型")
+
+        response["taxonomy"]["evidence"] = "問題にない内容"
+        parsed = classification._parse_ollama_result(
+            json.dumps(response, ensure_ascii=False), question, "qwen2.5:latest"
+        )
+        self.assertEqual(parsed["taxonomy"]["value"], "判定保留")
+        response["formats"]["その他"] = {
+            "value": "非該当",
+            "evidence": "",
+            "rationale": "問題構造に特殊な形式がない。",
+        }
+        response["taxonomy"] = {
+            "value": "Ⅱ型",
+            "evidence": "橈骨",
+            "rationale": "提示情報を解釈して判断する。",
+        }
+        parsed = classification._parse_ollama_result(
+            json.dumps(response, ensure_ascii=False), question, "qwen2.5:latest"
+        )
+        self.assertEqual(parsed["formats"]["その他"]["value"], "非該当")
+        for unsafe_url in (
+            "https://127.0.0.1:11434",
+            "http://example.com:11434",
+            "http://localhost:bad",
+            "http://localhost:11434/api",
+        ):
+            with self.subTest(url=unsafe_url), self.assertRaises(ValueError):
+                classification._local_ollama_url(unsafe_url)
+
+    def test_ollama_streaming_response_is_reassembled_before_validation(self):
+        question_record = classification._make_record(
+            pd.Series(question_row(1, "橈骨の名称はどれか。")), "解剖学"
+        )
+        question = json.loads(question_record["question_json"])
+        response_text = json.dumps(self._ollama_candidate(), ensure_ascii=False)
+        midpoint = len(response_text) // 2
+        chunks = [
+            json.dumps({"response": response_text[:midpoint]}),
+            json.dumps({"response": response_text[midpoint:]}),
+        ]
+        stream = io.BytesIO("\n".join(chunks).encode("utf-8"))
+        with patch("classification.urlopen", return_value=stream) as request:
+            result = classification._call_ollama(
+                question, "qwen2.5:latest", timeout=1
+            )
+
+        self.assertEqual(result["taxonomy"]["value"], "Ⅱ型")
+        payload = json.loads(request.call_args.args[0].data)
+        self.assertTrue(payload["stream"])
+        self.assertEqual(payload["options"]["num_predict"], 512)
+
+    def test_ollama_batches_create_candidates_preserve_images_and_manual_values(self):
+        classification.sync_questions(self.database_path, self.question_sheets())
+        job = classification.start_ollama_job(self.database_path)
+        with patch(
+            "classification._call_ollama",
+            return_value=self._ollama_candidate(),
+        ) as call:
+            result = classification.run_ollama_batch(
+                self.database_path, job["job_id"], batch_size=3
+            )
+        self.assertEqual(result["処理済み件数"], 3)
+        self.assertEqual(call.call_count, 3)
+
+        direct_id = "第1回/解剖学/No.1"
+        case_id = "第1回/解剖学/No.2"
+        direct = classification.get_classification(self.database_path, direct_id)
+        case = classification.get_classification(self.database_path, case_id)
+        self.assertEqual(direct["taxonomy"], "Ⅱ型")
+        self.assertEqual(direct["taxonomy_status"], "ローカルLLM候補")
+        self.assertEqual(case["format_values"]["画像使用"], "該当")
+        self.assertEqual(case["llm_status"], "完了")
+        self.assertEqual(case["llm_candidate"]["model"], "qwen2.5:latest")
+
+        classification.save_classification(
+            self.database_path,
+            direct_id,
+            self._confirmed_values("非該当", "Ⅲ型"),
+        )
+        next_job = classification.start_ollama_job(
+            self.database_path, model="qwen2.5:3b"
+        )
+        self.assertEqual(next_job["total_count"], 2)
+        with patch(
+            "classification._call_ollama",
+            return_value=self._ollama_candidate(),
+        ):
+            classification.run_ollama_batch(
+                self.database_path, next_job["job_id"], batch_size=3
+            )
+        confirmed = classification.get_classification(self.database_path, direct_id)
+        self.assertEqual(confirmed["taxonomy"], "Ⅲ型")
+        self.assertEqual(confirmed["taxonomy_status"], "人間確認済み")
+
+    def test_ollama_errors_are_visible_and_retryable(self):
+        classification.sync_questions(self.database_path, self.question_sheets())
+        job = classification.start_ollama_job(self.database_path)
+        with patch(
+            "classification._call_ollama",
+            side_effect=[
+                classification.OllamaError("model unavailable"),
+                self._ollama_candidate(),
+                self._ollama_candidate(),
+            ],
+        ):
+            result = classification.run_ollama_batch(
+                self.database_path, job["job_id"], batch_size=3
+            )
+        self.assertEqual(result["エラー件数"], 1)
+        errors = classification.list_ollama_job_errors(
+            self.database_path, job["job_id"]
+        )
+        self.assertEqual(len(errors), 1)
+
+        retry_job = classification.start_ollama_job(
+            self.database_path, retry_errors_only=True
+        )
+        self.assertEqual(retry_job["total_count"], 1)
+        with patch(
+            "classification._call_ollama",
+            return_value=self._ollama_candidate(),
+        ):
+            retry = classification.run_ollama_batch(
+                self.database_path, retry_job["job_id"], batch_size=1
+            )
+        self.assertEqual(retry["処理済み件数"], 1)
+        self.assertEqual(
+            classification.get_progress(self.database_path)["Ollamaエラー"],
+            0,
         )
 
 

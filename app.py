@@ -1176,8 +1176,8 @@ with tab_classification:
         "大項目・中項目は既存値を参照するだけで、変更・再分類しません。"
     )
     st.warning(
-        "Ollamaのモデル名・接続設定が未確定です。現在は保守的なルール候補のみを作成し、"
-        "判断できない値は保留します。ルール候補は人間確認済み集計に含めません。"
+        "Ollamaの補助判定を追加しました。モデルの出力は根拠引用を検証したうえで候補として保存し、"
+        "人間確認済み集計には含めません。全件を一括送信せず、明示操作した小バッチだけを処理します。"
     )
     st.caption(
         "Ⅰ型は単純想起型、Ⅱ型は解釈型、Ⅲ型は問題解決型です。"
@@ -1226,6 +1226,10 @@ with tab_classification:
         progress_columns[1].metric("ルール処理済み", progress["ルール処理済み"])
         progress_columns[2].metric("未処理", progress["未処理"])
         progress_columns[3].metric("エラー", progress["エラー"])
+        llm_progress_columns = st.columns(3)
+        llm_progress_columns[0].metric("Ollama処理済み", progress["Ollama処理済み"])
+        llm_progress_columns[1].metric("Ollama未処理", progress["Ollama未処理"])
+        llm_progress_columns[2].metric("Ollamaエラー", progress["Ollamaエラー"])
 
         job = cl.get_job_status(review_database)
         if job:
@@ -1287,6 +1291,128 @@ with tab_classification:
         if "classification_batch_result" in st.session_state:
             st.dataframe(
                 pd.DataFrame([st.session_state["classification_batch_result"]]),
+                width="stretch",
+                hide_index=True,
+            )
+
+        st.subheader("Ollamaによる未確定問題の補助判定")
+        ollama_config_columns = st.columns(2)
+        ollama_base_url = ollama_config_columns[0].text_input(
+            "OllamaのローカルURL",
+            value=cl.DEFAULT_OLLAMA_URL,
+            key="classification_ollama_url",
+        )
+        ollama_model = ollama_config_columns[1].text_input(
+            "Ollamaモデル",
+            value=cl.DEFAULT_OLLAMA_MODEL,
+            key="classification_ollama_model",
+        )
+        st.caption(
+            "問題情報はlocalhostのOllamaにのみ送信します。モデルの根拠引用が原文にない分類は保留にします。"
+            "画像内容は送信・認識せず、図参照による画像使用の候補を維持します。"
+        )
+        if st.button("Ollama接続とモデルを確認", key="classification_ollama_check"):
+            try:
+                available_models = cl.list_ollama_models(ollama_base_url)
+            except (cl.OllamaError, ValueError) as exc:
+                st.error(str(exc))
+            else:
+                st.write("利用可能モデル:", "、".join(available_models) or "なし")
+                if ollama_model not in available_models:
+                    st.warning("指定モデルが一覧にありません。モデル名を確認してください。")
+
+        ollama_job = cl.get_ollama_job_status(review_database)
+        if ollama_job:
+            st.caption(
+                f"Ollama処理 #{ollama_job['job_id']}: {ollama_job['status']} / "
+                f"{ollama_job.get('処理済み件数', 0)}件完了 / "
+                f"{ollama_job.get('未処理件数', 0)}件未処理 / "
+                f"{ollama_job.get('エラー件数', 0)}件エラー / "
+                f"モデル: {ollama_job['model']}"
+            )
+            ollama_total = ollama_job["total_count"]
+            ollama_done = (
+                ollama_job.get("処理済み件数", 0)
+                + ollama_job.get("エラー件数", 0)
+            )
+            st.progress(ollama_done / ollama_total if ollama_total else 0.0)
+            ollama_errors = cl.list_ollama_job_errors(
+                review_database, ollama_job["job_id"]
+            )
+            if not ollama_errors.empty:
+                with st.expander("Ollama判定エラー"):
+                    st.dataframe(ollama_errors, width="stretch", hide_index=True)
+
+        if ollama_job and ollama_job["status"] == "実行中":
+            ollama_process_col, ollama_pause_col = st.columns(2)
+            if ollama_process_col.button(
+                f"Ollamaで次の{cl.DEFAULT_OLLAMA_BATCH_SIZE}問を判定",
+                key="classification_ollama_batch",
+            ):
+                try:
+                    ollama_batch_result = cl.run_ollama_batch(
+                        review_database,
+                        ollama_job["job_id"],
+                        cl.DEFAULT_OLLAMA_BATCH_SIZE,
+                    )
+                except ValueError as exc:
+                    st.error(str(exc))
+                else:
+                    st.session_state["classification_ollama_batch_result"] = (
+                        ollama_batch_result
+                    )
+                    st.session_state.pop("classification_analysis_result", None)
+                    st.session_state.pop("classification_analysis_key", None)
+                    st.rerun()
+            if ollama_pause_col.button(
+                "Ollama処理をバッチ間で中断",
+                key="classification_ollama_pause",
+            ):
+                cl.pause_ollama_job(review_database, ollama_job["job_id"])
+                st.rerun()
+        elif ollama_job and ollama_job["status"] == "中断":
+            if st.button(
+                "Ollama処理を再開", key="classification_ollama_resume"
+            ):
+                cl.resume_ollama_job(review_database, ollama_job["job_id"])
+                st.rerun()
+        else:
+            ollama_start_col, ollama_retry_col = st.columns(2)
+            if ollama_start_col.button(
+                "Ollama判定を開始（未確認問題をキュー）",
+                key="classification_ollama_start",
+            ):
+                try:
+                    cl.start_ollama_job(
+                        review_database,
+                        model=ollama_model,
+                        base_url=ollama_base_url,
+                    )
+                except (cl.OllamaError, ValueError) as exc:
+                    st.error(str(exc))
+                else:
+                    st.rerun()
+            if ollama_retry_col.button(
+                "Ollamaエラー問題のみ再処理",
+                key="classification_ollama_retry",
+            ):
+                try:
+                    cl.start_ollama_job(
+                        review_database,
+                        model=ollama_model,
+                        base_url=ollama_base_url,
+                        retry_errors_only=True,
+                    )
+                except (cl.OllamaError, ValueError) as exc:
+                    st.info(str(exc))
+                else:
+                    st.rerun()
+
+        if "classification_ollama_batch_result" in st.session_state:
+            st.dataframe(
+                pd.DataFrame([
+                    st.session_state["classification_ollama_batch_result"]
+                ]),
                 width="stretch",
                 hide_index=True,
             )
@@ -1406,6 +1532,9 @@ with tab_classification:
             if annotation["candidate"]:
                 with st.expander("ルール候補と根拠"):
                     st.json(annotation["candidate"])
+            if annotation["llm_candidate"]:
+                with st.expander("Ollama候補・根拠引用・使用モデル"):
+                    st.json(annotation["llm_candidate"])
             st.caption(
                 "ルール候補は暫定です。Taxonomyは症例形式・文章量・画像の有無だけで"
                 "Ⅲ型にしないでください。"
