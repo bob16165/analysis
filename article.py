@@ -1,5 +1,7 @@
 """既存の分析結果から、期間比較の記事たたき台を作る。"""
 
+from typing import Optional
+
 import pandas as pd
 
 import analysis
@@ -77,7 +79,7 @@ def build_article_data(freq_file, past_file, subject: str, major: str,
     exact_stop.add(terms.norm(major))
     curated = analysis.load_medical_terms() + list(dictionary["重要語(疾患・所見)"])
     frequent = terms.topic_frequent_terms(
-        target_questions, targets, curated, stop, exact_stop
+        target_questions, targets, curated, stop, exact_stop, top=5, include_roles=True
     )
 
     taxonomy_rows = []
@@ -145,11 +147,19 @@ def build_article_data(freq_file, past_file, subject: str, major: str,
 
 
 def generate_article(result: dict, mea: str = "", next_theme: str = "",
-                     mock_results: str = "") -> str:
+                     mock_results: str = "",
+                     selected_terms: Optional[dict[str, list[str]]] = None) -> str:
     subject, major = result["科目"], result["大項目"]
     ranking = result["順位"]
     targets = ranking["中項目"].tolist()
     periods = result["期間別"]
+    selected_terms = {} if selected_terms is None else selected_terms
+    if set(selected_terms) - set(targets):
+        raise ValueError("分析対象外の中項目が選択されています。候補を再表示してください。")
+    for topic, words in selected_terms.items():
+        candidates = result["頻出語"].loc[result["頻出語"]["中項目"].eq(topic), "語"].tolist()
+        if len(words) > 3 or len(words) != len(set(words)) or not set(words).issubset(candidates):
+            raise ValueError(f"{topic}の選択が不正です。表示された候補から3語まで選択してください。")
     sections = [
         f"# {subject}「{major}」の出題傾向\n\n"
         "第1〜34回の出題頻度表で上位3中項目を選び、"
@@ -194,7 +204,9 @@ def generate_article(result: dict, mea: str = "", next_theme: str = "",
     )
     for topic in targets:
         topic_taxonomy = result["Taxonomy"][result["Taxonomy"]["中項目"].eq(topic)]
-        lines = [f"## {topic}：Taxonomyと頻出語"]
+        selected = selected_terms.get(topic, [])
+        heading = "Taxonomyと頻出語" if selected else "Taxonomy"
+        lines = [f"## {topic}：{heading}"]
         if not topic_taxonomy["利用可能"].all():
             lines.append("Taxonomy：現在の過去問に同期済みの分類を確認できません。")
         else:
@@ -205,19 +217,30 @@ def generate_article(result: dict, mea: str = "", next_theme: str = "",
                     f"| {row['期間']} | {row['Ⅰ型']} | {row['Ⅱ型']} | {row['Ⅲ型']} | "
                     f"{row['分類済み']} | {row['判定保留']} | {row['未確認']} |"
                 )
-        words = result["頻出語"][result["頻出語"]["中項目"].eq(topic)].sort_values("順位")
-        if words.empty:
-            lines.append("頻出語候補：条件を満たす語はありません。")
-        else:
+        words = result["頻出語"][
+            result["頻出語"]["中項目"].eq(topic) & result["頻出語"]["語"].isin(selected)
+        ].sort_values("順位")
+        if not words.empty:
             lines.append("頻出語候補（第1〜34回）：")
             for _, row in words.iterrows():
-                lines.append(f"- 「{row['語']}」：{int(row['出現問題数'])}問。該当問題：{row['問題ID']}")
+                occurrences = []
+                for label, column in (
+                    ("問題文", "問題文ID"), ("正答選択肢", "正答選択肢ID"),
+                    ("誤答選択肢", "誤答選択肢ID"), ("正答不明の選択肢", "正答不明の選択肢ID"),
+                ):
+                    if row[column]:
+                        occurrences.append(f"{label}：{row[column]}")
+                lines.append(
+                    f"- 「{row['語']}」：{int(row['出現問題数'])}問。該当問題：{row['問題ID']}。"
+                    + "／".join(occurrences)
+                )
         sections.append("\n\n".join(lines))
     sections.append(
         "Taxonomyは人間確認済み・修正済みのⅠ〜Ⅲ型のみを分類済み分母とし、"
         "確認済み保留と未確認を分けています。難易度ではありません。"
-        "頻出語は問題文と全選択肢に2問以上出現した候補で、誤答も含みます。"
-        "正答や問題の主題を意味するとは限らないため、問題IDから原資料を確認してください。"
+        + ("頻出語は問題文と全選択肢に2問以上出現した候補で、誤答も含みます。"
+           "出現場所は同一問題で重複する場合があります。正答や問題の主題を意味するとは限らないため、"
+           "問題IDから原資料を確認してください。" if any(selected_terms.values()) else "")
     )
     trend_result = result["トレンド"]
     lines = ["## 近年のトレンド（第25〜34回）"]

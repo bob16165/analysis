@@ -77,6 +77,11 @@ with tab_run:
         st.session_state["result_question_signature"] = current_question_file_signature
         st.session_state["result_frequency_signature"] = file_signature(freq_file)
         st.session_state.pop("article_draft", None)
+        st.session_state.pop("article_candidate_data", None)
+        st.session_state.pop("article_candidate_key", None)
+        st.session_state.pop("article_draft_selection", None)
+        for index in range(3):
+            st.session_state.pop(f"article_terms_selection_{index}", None)
 
     result = st.session_state.get("result")
     if result:
@@ -159,19 +164,74 @@ with tab_run:
         mea = st.text_area("MEAの紹介文（任意）", key="article_mea")
         mock_results = st.text_area("自校の模試結果・集計条件（任意）", key="article_mock")
         next_theme = st.text_input("次回の分析テーマ（任意）", key="article_next")
-        if st.button("記事のたたき台を作成"):
+        article_subject = str(article_summary["科目"])
+        article_major = str(article_summary["大項目"])
+        source_is_current = (
+            st.session_state.get("result_question_signature") == current_question_file_signature
+            and st.session_state.get("result_frequency_signature") == file_signature(freq_file)
+            and subject == article_subject and major == article_major
+        )
+        candidate_key = (
+            current_question_file_signature, file_signature(freq_file),
+            file_signature(an.DICT_PATH),
+            file_signature(an.MEDICAL_TERMS_PATH) if an.MEDICAL_TERMS_PATH.exists() else None,
+            article_subject, article_major,
+        )
+        st.caption(
+            "記事用に各中項目の上位5候補を表示し、掲載する語を3件まで選べます。"
+            "選択なしの場合、その中項目の頻出語は記事に載りません。"
+            "各問題は複数の出現場所に重複する場合があります。"
+        )
+        if st.button("記事用の頻出語候補を表示"):
             try:
-                if (
-                    st.session_state.get("result_question_signature") != current_question_file_signature
-                    or st.session_state.get("result_frequency_signature") != file_signature(freq_file)
-                ):
-                    raise ValueError("入力ファイルが分析後に変更されています。再分析してください。")
+                if not source_is_current:
+                    raise ValueError("分析対象または入力ファイルが変更されています。再分析してください。")
+                candidate_data = article.build_article_data(
+                    freq_file, past_file, article_subject, article_major
+                )
+                st.session_state["article_candidate_data"] = candidate_data
+                st.session_state["article_candidate_key"] = candidate_key
+                for index in range(3):
+                    st.session_state.pop(f"article_terms_selection_{index}", None)
+            except ValueError as e:
+                st.error(str(e))
+        candidate_ready = (
+            source_is_current
+            and st.session_state.get("article_candidate_key") == candidate_key
+            and "article_candidate_data" in st.session_state
+        )
+        selected_terms = {}
+        if candidate_ready:
+            candidate_data = st.session_state["article_candidate_data"]
+            for index, topic in enumerate(candidate_data["順位"]["中項目"]):
+                candidates = candidate_data["頻出語"][
+                    candidate_data["頻出語"]["中項目"].eq(topic)
+                ].sort_values("順位")
+                st.markdown(f"**{topic}**")
+                if candidates.empty:
+                    st.info("2問以上に出現する頻出語候補はありません。")
+                    continue
+                st.dataframe(
+                    candidates[[
+                        "順位", "語", "出現問題数", "問題ID", "問題文ID",
+                        "正答選択肢ID", "誤答選択肢ID", "正答不明の選択肢ID",
+                    ]],
+                    width="stretch", hide_index=True,
+                )
+                selected_terms[topic] = st.multiselect(
+                    f"{topic}で記事に載せる語", candidates["語"].tolist(),
+                    max_selections=3, key=f"article_terms_selection_{index}",
+                )
+        elif "article_candidate_data" in st.session_state:
+            st.warning("分析対象・入力ファイル・辞書が変わりました。必要に応じて再分析し、候補を再表示してください。")
+        if st.button("記事のたたき台を作成", disabled=not candidate_ready):
+            try:
                 article_classification = None
                 if cl.get_source_signature(review_database) == current_question_file_signature:
                     article_classification = cl.build_classification_analysis(
                         review_database,
                         1, 34,
-                        str(article_summary["科目"]),
+                        article_subject,
                     )["問題別分類・根拠"]
                 article_repeats = None
                 if repeat_analysis.get_source_signature(review_database) == current_question_file_signature:
@@ -187,15 +247,21 @@ with tab_run:
                         offset += len(page)
                     article_repeats = pd.concat(pages, ignore_index=True)
                 article_data = article.build_article_data(
-                    freq_file, past_file, str(article_summary["科目"]),
-                    str(article_summary["大項目"]), article_classification, article_repeats,
+                    freq_file, past_file, article_subject, article_major,
+                    article_classification, article_repeats,
                 )
                 st.session_state["article_draft"] = article.generate_article(
                     article_data, mea=mea, next_theme=next_theme, mock_results=mock_results,
+                    selected_terms=selected_terms,
+                )
+                st.session_state["article_draft_selection"] = (
+                    candidate_key, {topic: list(words) for topic, words in selected_terms.items()}
                 )
             except ValueError as e:
                 st.error(str(e))
         if "article_draft" in st.session_state:
+            if st.session_state.get("article_draft_selection") != (candidate_key, selected_terms):
+                st.warning("現在の選択は表示中の記事に反映されていません。再作成してください。")
             draft = st.text_area("記事本文（編集できます）", key="article_draft", height=600)
             count = len(draft)
             st.caption(f"文字数：{count:,}字（改行・記号を含む）")

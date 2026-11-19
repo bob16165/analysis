@@ -4,6 +4,7 @@
 同じ出題数で長い語に含まれる断片(閉包でない語)を落とす。
 """
 import re
+import unicodedata
 from collections import defaultdict
 
 import pandas as pd
@@ -145,9 +146,13 @@ def related_terms(all_q: pd.DataFrame, major: str, targets: list[str], curated: 
 
 
 def topic_frequent_terms(questions: pd.DataFrame, targets: list[str], curated: list[str],
-                         stop: set[str], exact_stop: set[str], top: int = 3) -> pd.DataFrame:
+                         stop: set[str], exact_stop: set[str], top: int = 3,
+                         include_roles: bool = False) -> pd.DataFrame:
     """対象期間の中項目ごとに、少なくとも2問に現れる候補語を集計する。"""
     columns = ["中項目", "順位", "語", "出現問題数", "対象問題数", "問題ID"]
+    role_columns = ["問題文ID", "正答選択肢ID", "誤答選択肢ID", "正答不明の選択肢ID"]
+    if include_roles:
+        columns += role_columns
     questions = questions.reset_index(drop=True)
     if questions.empty:
         return pd.DataFrame(columns=columns)
@@ -172,14 +177,37 @@ def topic_frequent_terms(questions: pd.DataFrame, targets: list[str], curated: l
         candidates.sort(key=lambda word: (-len(topic_index[word]), word))
         for rank, word in enumerate(candidates[:top], 1):
             matches = sorted(topic_index[word])
-            rows.append({
+            row = {
                 "中項目": topic,
                 "順位": rank,
                 "語": word,
                 "出現問題数": len(matches),
                 "対象問題数": len(positions),
                 "問題ID": "、".join(str(questions.iloc[pos]["問題ID"]) for pos in matches),
-            })
+            }
+            if include_roles:
+                roles = {column: [] for column in role_columns}
+                for pos in matches:
+                    question = questions.iloc[pos]
+                    bits = topic_index[word][pos]
+                    question_id = str(question["問題ID"])
+                    answer = unicodedata.normalize("NFKC", str(question["模範解答"])).strip()
+                    if re.fullmatch(r"[1-4]\.0", answer):
+                        answer = answer[0]
+                    valid_answer = bool(re.fullmatch(r"[1-4](?:[\s・,、/]+[1-4])*", answer))
+                    if bits & STEM:
+                        roles["問題文ID"].append(question_id)
+                    choices = [i for i in CHOICE_IDX if word in norm(question[f"選択肢{i}"])]
+                    if valid_answer:
+                        correct = set(re.findall(r"[1-4]", answer))
+                        if any(i in correct for i in choices):
+                            roles["正答選択肢ID"].append(question_id)
+                        if any(i not in correct for i in choices):
+                            roles["誤答選択肢ID"].append(question_id)
+                    elif choices:
+                        roles["正答不明の選択肢ID"].append(question_id)
+                row.update({column: "、".join(ids) for column, ids in roles.items()})
+            rows.append(row)
     return pd.DataFrame(rows, columns=columns)
 
 

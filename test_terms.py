@@ -43,6 +43,34 @@ class TopicFrequentTermsTests(unittest.TestCase):
             ["中項目", "順位", "語", "出現問題数", "対象問題数", "問題ID"],
         )
 
+    def test_five_candidates_and_roles_with_unknown_answers(self):
+        questions = pd.DataFrame([
+            {"中項目": "A", "問題ID": "q1", "問題": "骨折、神経、血管、筋肉、関節、脱臼",
+             "選択肢1": "骨折", "選択肢2": "骨折", "選択肢3": "", "選択肢4": "", "模範解答": "１"},
+            {"中項目": "A", "問題ID": "q2", "問題": "神経、血管、筋肉、関節、脱臼",
+             "選択肢1": "骨折", "選択肢2": "", "選択肢3": "", "選択肢4": "", "模範解答": ""},
+            {"中項目": "A", "問題ID": "q3", "問題": "",
+             "選択肢1": "骨折", "選択肢2": "", "選択肢3": "", "選択肢4": "", "模範解答": "1・5"},
+            {"中項目": "A", "問題ID": "q4", "問題": "",
+             "選択肢1": "骨折", "選択肢2": "", "選択肢3": "", "選択肢4": "", "模範解答": 1.0},
+            {"中項目": "A", "問題ID": "q5", "問題": "",
+             "選択肢1": "骨折", "選択肢2": "骨折", "選択肢3": "", "選択肢4": "", "模範解答": "1・2"},
+        ])
+        curated = ["骨折", "神経", "血管", "筋肉", "関節", "脱臼"]
+        default = terms.topic_frequent_terms(questions, ["A"], curated, set(), set())
+        self.assertEqual(len(default), 3)
+        result = terms.topic_frequent_terms(
+            questions, ["A"], curated, set(), set(), top=5, include_roles=True
+        )
+        self.assertEqual(len(result), 5)
+        self.assertEqual(result["語"].tolist()[:3], default["語"].tolist())
+        row = result[result["語"].eq("骨折")].iloc[0]
+        self.assertEqual(row["出現問題数"], 5)
+        self.assertEqual(row["問題文ID"], "q1")
+        self.assertEqual(row["正答選択肢ID"], "q1、q4、q5")
+        self.assertEqual(row["誤答選択肢ID"], "q1")
+        self.assertEqual(row["正答不明の選択肢ID"], "q2、q3")
+
 
 if __name__ == "__main__":
     unittest.main()

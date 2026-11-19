@@ -85,8 +85,9 @@ class ArticleGenerationTests(unittest.TestCase):
         self.assertEqual(a.loc["第1〜9回", "Ⅰ型"], 1)
         self.assertEqual(a.loc["第10〜18回", "判定保留"], 1)
         self.assertEqual(a.loc["第19〜27回", "未確認"], 1)
-        text = article.generate_article(data)
+        text = article.generate_article(data, selected_terms={"A": ["橈骨骨折"]})
         self.assertIn("「橈骨骨折」：3問", text)
+        self.assertIn("問題文：第1回No.2", text)
         self.assertIn("第1回No.2", text)
         self.assertIn("第19回No.2", text)
         self.assertIn("人間確認済み：第1回/整形外科/No.2", text)
@@ -117,7 +118,28 @@ class ArticleGenerationTests(unittest.TestCase):
         ]
         data = self.build()
         self.assertTrue(data["期間別"]["問題数"].eq(0).all())
-        self.assertIn("条件を満たす語はありません", article.generate_article(data))
+        self.assertNotIn("頻出語候補", article.generate_article(data))
+
+    def test_only_selected_candidates_are_included_and_invalid_selections_fail(self):
+        data = self.build()
+        original = data["頻出語"].iloc[0].copy()
+        candidates = []
+        for rank, word in enumerate(["骨折", "血管", "関節", "神経", "筋肉"], 1):
+            row = original.copy()
+            row["順位"], row["語"] = rank, word
+            candidates.append(row)
+        data["頻出語"] = pd.DataFrame(candidates)
+        text = article.generate_article(data, selected_terms={"A": ["筋肉", "血管"]})
+        self.assertIn("「筋肉」", text)
+        self.assertIn("「血管」", text)
+        self.assertNotIn("「骨折」：", text)
+        self.assertNotIn("「神経」", text)
+        self.assertNotIn("頻出語候補", article.generate_article(data))
+        for selection in ({"B": ["筋肉"]}, {"対象外": ["筋肉"]},
+                          {"A": ["存在しない語"]}, {"A": ["筋肉", "筋肉"]},
+                          {"A": ["骨折", "血管", "関節", "神経"]}):
+            with self.subTest(selection=selection), self.assertRaises(ValueError):
+                article.generate_article(data, selected_terms=selection)
 
     def test_only_unassigned_questions_do_not_create_trend_results(self):
         self.questions = self.questions[
