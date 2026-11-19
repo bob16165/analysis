@@ -10,6 +10,7 @@ import article
 import repeats as repeat_analysis
 import standard_history as sh
 import trends
+import question_review as qr
 
 st.set_page_config(page_title="出題傾向分析", layout="wide")
 st.title("国試 出題傾向分析")
@@ -44,8 +45,14 @@ if not (freq_file and past_file):
     st.info("2つのExcelを指定してください。")
     st.stop()
 
-tab_run, tab_search, tab_dict, tab_trend, tab_repeats, tab_standard = st.tabs(
-    ["分析", "語句検索", "辞書の編集", "出題トレンド", "再出題・類題", "出題基準別実績"]
+review_database = APP_DIR / "analysis_review.sqlite3"
+current_question_file_signature = file_signature(past_file)
+
+tab_run, tab_search, tab_dict, tab_trend, tab_repeats, tab_question_review, tab_standard = st.tabs(
+    [
+        "分析", "語句検索", "辞書の編集", "出題トレンド", "再出題・類題",
+        "問題形式・出題構造", "出題基準別実績",
+    ]
 )
 
 with tab_run:
@@ -304,8 +311,6 @@ with tab_trend:
                 st.info("分析条件または入力データが変わりました。再分析してください。")
 
 with tab_repeats:
-    review_database = APP_DIR / "analysis_review.sqlite3"
-    current_question_file_signature = file_signature(past_file)
     st.caption(
         "問題文・選択肢・模範解答・正答の正規化一致をA候補、文字3-gramで絞った文字列類似度"
         f"（初期閾値{repeat_analysis.MIN_SIMILARITY:.2f}）をB候補として提示します。"
@@ -501,6 +506,475 @@ with tab_repeats:
             )
     else:
         st.info("まだレビュー用データベースがありません。過去問を同期してください。")
+
+with tab_question_review:
+    st.caption(
+        "問題形式・知識要求レベルは問題ごとに人が確認して保存します。"
+        "形式のルール候補はAI仮分類として表示し、確定集計には含めません。"
+        "テーマ共有の集計と、複数科目の知識が必要だと人が確認した問題は別指標です。"
+    )
+    st.warning(
+        "既存の語句一致による科目横断分析は「分析」タブに残しています。"
+        "ここでは文字列一致のみを根拠にテーマ共有や科目横断必須とは判定しません。"
+    )
+    if review_database.exists():
+        saved_question_signature = qr.get_source_signature(review_database)
+        if (
+            saved_question_signature
+            and saved_question_signature != current_question_file_signature
+        ):
+            st.warning("過去問.xlsxが前回同期後に変更されています。分類前に再同期してください。")
+        elif not saved_question_signature:
+            st.info("分類用の同期記録がありません。同期後に分類・集計できます。")
+
+    if st.button("過去問を同期して分類候補を更新", key="question_review_sync"):
+        question_sheets = {
+            name: an.load_questions(past_file, name, 1, 999)
+            for name in an.sheet_names(past_file)
+        }
+        try:
+            st.session_state["question_sync_result"] = qr.sync_question_annotations(
+                review_database,
+                question_sheets,
+                source_signature=current_question_file_signature,
+            )
+            st.session_state.pop("question_analysis_result", None)
+            st.session_state.pop("question_analysis_key", None)
+        except ValueError as exc:
+            st.error(str(exc))
+
+    if "question_sync_result" in st.session_state:
+        st.subheader("直近の同期結果")
+        st.dataframe(
+            pd.DataFrame([st.session_state["question_sync_result"]]),
+            width="stretch",
+            hide_index=True,
+        )
+
+    if not review_database.exists():
+        st.info("分類データはありません。過去問を同期してください。")
+    else:
+        review_scope = qr.get_review_scope(review_database)
+        if not review_scope["rounds"]:
+            st.info("分類データはありません。過去問を同期してください。")
+        else:
+            st.subheader("問題ごとの分類確認")
+            filter_col1, filter_col2, filter_col3 = st.columns(3)
+            review_subject = filter_col1.selectbox(
+                "科目",
+                ["全科目", *review_scope["subjects"]],
+                key="question_review_subject",
+            )
+            status_field_labels = {
+                "format_status": "問題形式",
+                "knowledge_status": "知識要求レベル",
+                "theme_status": "テーマ",
+                "cross_subject_status": "科目横断の必要性",
+            }
+            review_status_field = filter_col2.selectbox(
+                "確認対象",
+                list(status_field_labels),
+                format_func=lambda value: status_field_labels[value],
+                key="question_review_status_field",
+            )
+            review_status = filter_col3.selectbox(
+                "分類状態",
+                ["全て", *qr.ANNOTATION_STATUSES],
+                key="question_review_status",
+            )
+            query_col, offset_col = st.columns(2)
+            review_query = query_col.text_input(
+                "問題ID・大項目・中項目で検索",
+                key="question_review_query",
+            )
+            review_offset = offset_col.number_input(
+                "一覧の開始位置",
+                min_value=0,
+                max_value=100000,
+                value=0,
+                step=100,
+                key="question_review_offset",
+            )
+            review_questions = qr.list_review_questions(
+                review_database,
+                subject=review_subject,
+                status_field=review_status_field,
+                status=review_status,
+                query=review_query,
+                limit=100,
+                offset=int(review_offset),
+            )
+            st.dataframe(review_questions, width="stretch", hide_index=True)
+
+            if review_questions.empty:
+                st.info("この条件に該当する問題はありません。")
+            else:
+                review_problem_ids = review_questions["problem_id"].tolist()
+                selected_problem_id = st.selectbox(
+                    "分類を確認する問題",
+                    review_problem_ids,
+                    key="question_review_selected_problem",
+                )
+                annotation = qr.get_annotation(review_database, selected_problem_id)
+                question = annotation["question"]
+                st.markdown(f"**{selected_problem_id}**")
+                st.write("大項目 / 中項目", annotation["major"], "/", annotation["middle"])
+                st.write("問題文", question.get("問題", ""))
+                for choice_number, choice in enumerate(question.get("選択肢", []), 1):
+                    st.write(f"選択肢{choice_number}", choice)
+                st.write("模範解答", question.get("模範解答", ""))
+                st.write("正答", question.get("正答", ""))
+                if question.get("図"):
+                    st.caption(f"図の参照: {question['図']}")
+                if question.get("症例問題"):
+                    st.caption(f"症例欄: {question['症例問題']}")
+                if question.get("解説"):
+                    with st.expander("解説"):
+                        st.write(question["解説"])
+                if annotation["suggestion_rationale"]:
+                    st.caption(
+                        f"形式の自動候補: {annotation['suggested_format'] or 'なし'}。"
+                        f"根拠: {annotation['suggestion_rationale']}"
+                    )
+
+                subject_options = [
+                    name for name in review_scope["subjects"]
+                    if name != annotation["subject"]
+                ]
+                current_format = annotation["format_main"] or "未分類"
+                current_level = annotation["knowledge_level"] or "未分類"
+                current_required = annotation["cross_subject_required"]
+                required_options = ["未判定", "必要", "不要"]
+                required_value = (
+                    "必要" if current_required == 1
+                    else "不要" if current_required == 0
+                    else "未判定"
+                )
+                with st.form(f"question_annotation_{selected_problem_id}"):
+                    st.subheader("問題形式")
+                    form_col1, form_col2 = st.columns(2)
+                    format_status = form_col1.selectbox(
+                        "分類状態",
+                        qr.ANNOTATION_STATUSES,
+                        index=qr.ANNOTATION_STATUSES.index(annotation["format_status"]),
+                        key=f"format_status_{selected_problem_id}",
+                    )
+                    format_main = form_col2.selectbox(
+                        "主分類",
+                        ["未分類", *qr.FORMATS],
+                        index=(["未分類", *qr.FORMATS]).index(current_format),
+                        key=f"format_main_{selected_problem_id}",
+                    )
+                    format_secondary = st.multiselect(
+                        "副分類",
+                        qr.FORMATS,
+                        default=annotation["format_secondary"],
+                        key=f"format_secondary_{selected_problem_id}",
+                    )
+                    format_rationale = st.text_area(
+                        "問題形式の分類根拠",
+                        value=annotation["format_rationale"],
+                        key=f"format_rationale_{selected_problem_id}",
+                    )
+
+                    st.subheader("知識要求レベル")
+                    level_col1, level_col2 = st.columns(2)
+                    knowledge_status = level_col1.selectbox(
+                        "分類状態",
+                        qr.ANNOTATION_STATUSES,
+                        index=qr.ANNOTATION_STATUSES.index(annotation["knowledge_status"]),
+                        key=f"knowledge_status_{selected_problem_id}",
+                    )
+                    knowledge_level = level_col2.selectbox(
+                        "レベル",
+                        ["未分類", *qr.KNOWLEDGE_LEVELS],
+                        index=(["未分類", *qr.KNOWLEDGE_LEVELS]).index(current_level),
+                        key=f"knowledge_level_{selected_problem_id}",
+                    )
+                    knowledge_rationale = st.text_area(
+                        "知識要求レベルの判断根拠",
+                        value=annotation["knowledge_rationale"],
+                        key=f"knowledge_rationale_{selected_problem_id}",
+                    )
+
+                    st.subheader("テーマ分類")
+                    theme_status = st.selectbox(
+                        "分類状態",
+                        qr.ANNOTATION_STATUSES,
+                        index=qr.ANNOTATION_STATUSES.index(annotation["theme_status"]),
+                        key=f"theme_status_{selected_problem_id}",
+                    )
+                    theme_text = st.text_area(
+                        "テーマ（1行に「区分 | テーマ名」）",
+                        value="\n".join(
+                            f"{theme['category']} | {theme['label']}"
+                            for theme in annotation["themes"]
+                        ),
+                        help="区分: " + "、".join(qr.THEME_DOMAINS),
+                        key=f"theme_values_{selected_problem_id}",
+                    )
+                    theme_rationale = st.text_area(
+                        "テーマの判断根拠",
+                        value=annotation["theme_rationale"],
+                        key=f"theme_rationale_{selected_problem_id}",
+                    )
+
+                    st.subheader("科目横断の必要性")
+                    cross_col1, cross_col2 = st.columns(2)
+                    cross_status = cross_col1.selectbox(
+                        "分類状態",
+                        qr.ANNOTATION_STATUSES,
+                        index=qr.ANNOTATION_STATUSES.index(
+                            annotation["cross_subject_status"]
+                        ),
+                        key=f"cross_status_{selected_problem_id}",
+                    )
+                    cross_required_choice = cross_col2.selectbox(
+                        "この問題を解くために他科目の知識が必要か",
+                        required_options,
+                        index=required_options.index(required_value),
+                        key=f"cross_required_{selected_problem_id}",
+                    )
+                    related_subjects = st.multiselect(
+                        "関連する科目",
+                        subject_options,
+                        default=[
+                            name for name in annotation["related_subjects"]
+                            if name in subject_options
+                        ],
+                        key=f"related_subjects_{selected_problem_id}",
+                    )
+                    cross_rationale = st.text_area(
+                        "科目横断の判断根拠",
+                        value=annotation["cross_subject_rationale"],
+                        key=f"cross_rationale_{selected_problem_id}",
+                    )
+                    submitted = st.form_submit_button("分類・確認結果を保存")
+
+                if submitted:
+                    try:
+                        themes = qr.parse_theme_lines(theme_text)
+                        changed = qr.save_annotation(
+                            review_database,
+                            selected_problem_id,
+                            {
+                                "format_main": (
+                                    None if format_main == "未分類" else format_main
+                                ),
+                                "format_secondary": format_secondary,
+                                "format_rationale": format_rationale,
+                                "format_status": format_status,
+                                "knowledge_level": (
+                                    None if knowledge_level == "未分類"
+                                    else knowledge_level
+                                ),
+                                "knowledge_rationale": knowledge_rationale,
+                                "knowledge_status": knowledge_status,
+                                "themes": themes,
+                                "theme_rationale": theme_rationale,
+                                "theme_status": theme_status,
+                                "cross_subject_required": {
+                                    "未判定": None,
+                                    "必要": True,
+                                    "不要": False,
+                                }[cross_required_choice],
+                                "related_subjects": related_subjects,
+                                "cross_subject_rationale": cross_rationale,
+                                "cross_subject_status": cross_status,
+                            },
+                        )
+                    except ValueError as exc:
+                        st.error(str(exc))
+                    else:
+                        if changed:
+                            st.session_state.pop("question_analysis_result", None)
+                            st.session_state.pop("question_analysis_key", None)
+                        st.success(
+                            "分類結果を保存しました。" if changed
+                            else "分類結果に変更はありません。"
+                        )
+
+                with st.expander("この問題の分類履歴"):
+                    question_history = qr.list_annotation_history(
+                        review_database, problem_id=selected_problem_id
+                    )
+                    st.dataframe(
+                        question_history, width="stretch", hide_index=True
+                    )
+
+            st.subheader("期間別の分析")
+            analysis_col1, analysis_col2, analysis_col3 = st.columns(3)
+            analysis_subject = analysis_col1.selectbox(
+                "分類・知識レベルの対象科目",
+                ["全科目", *review_scope["subjects"]],
+                key="question_analysis_subject",
+            )
+            min_round, max_round = min(review_scope["rounds"]), max(review_scope["rounds"])
+            analysis_start = analysis_col2.number_input(
+                "開始回",
+                min_value=min_round,
+                max_value=max_round,
+                value=min_round,
+                key="question_analysis_start",
+            )
+            analysis_end = analysis_col3.number_input(
+                "終了回",
+                min_value=min_round,
+                max_value=max_round,
+                value=max_round,
+                key="question_analysis_end",
+            )
+            analysis_key = (
+                current_question_file_signature,
+                analysis_subject,
+                int(analysis_start),
+                int(analysis_end),
+            )
+            if st.button(
+                "分類・出題構造を集計",
+                type="primary",
+                key="question_analysis_run",
+            ):
+                if analysis_start > analysis_end:
+                    st.error("開始回は終了回以前にしてください。")
+                else:
+                    st.session_state["question_analysis_result"] = (
+                        qr.build_question_analysis(
+                            review_database,
+                            int(analysis_start),
+                            int(analysis_end),
+                            analysis_subject,
+                        )
+                    )
+                    st.session_state["question_analysis_key"] = analysis_key
+
+            question_analysis = st.session_state.get("question_analysis_result")
+            if (
+                question_analysis
+                and st.session_state.get("question_analysis_key") == analysis_key
+            ):
+                st.caption(
+                    f"対象期間: 第{int(analysis_start)}〜{int(analysis_end)}回 / "
+                    f"分類・知識レベル: {analysis_subject} / "
+                    f"科目横断・テーマ分析: 全科目の人間確認済みデータ"
+                )
+                st.subheader("分類状況・科目別進捗")
+                st.dataframe(question_analysis["分析条件"], width="stretch", hide_index=True)
+                st.dataframe(question_analysis["分類状況"], width="stretch", hide_index=True)
+                st.dataframe(
+                    question_analysis["科目別レビュー進捗"],
+                    width="stretch",
+                    hide_index=True,
+                )
+                with st.expander("問題ごとの分類状態・根拠・問題ID"):
+                    st.dataframe(
+                        question_analysis["問題別分類・確認詳細"],
+                        width="stretch",
+                        hide_index=True,
+                    )
+                st.subheader("問題形式・知識要求レベル")
+                st.dataframe(
+                    question_analysis["問題形式別構成"],
+                    width="stretch",
+                    hide_index=True,
+                )
+                form_summary = question_analysis["問題形式別構成"]
+                if (
+                    not form_summary.empty
+                    and form_summary["確定分類内構成比(%)"].notna().any()
+                ):
+                    st.bar_chart(
+                        form_summary.set_index("分類")["確定分類内構成比(%)"]
+                    )
+                else:
+                    st.info("確定した問題形式がまだありません。")
+                st.dataframe(
+                    question_analysis["知識レベル別構成"],
+                    width="stretch",
+                    hide_index=True,
+                )
+                level_summary = question_analysis["知識レベル別構成"]
+                if (
+                    not level_summary.empty
+                    and level_summary["確定分類内構成比(%)"].notna().any()
+                ):
+                    st.bar_chart(
+                        level_summary.set_index("知識要求レベル")[
+                            "確定分類内構成比(%)"
+                        ]
+                    )
+                else:
+                    st.info("確定した知識要求レベルがまだありません。")
+                st.dataframe(
+                    question_analysis["期間別問題形式"],
+                    width="stretch",
+                    hide_index=True,
+                )
+                st.dataframe(
+                    question_analysis["期間別知識レベル"],
+                    width="stretch",
+                    hide_index=True,
+                )
+                st.dataframe(
+                    question_analysis["年度別問題形式"],
+                    width="stretch",
+                    hide_index=True,
+                )
+                st.dataframe(
+                    question_analysis["年度別知識レベル"],
+                    width="stretch",
+                    hide_index=True,
+                )
+                st.subheader("確認済みテーマに基づく科目間の共通性")
+                st.dataframe(
+                    question_analysis["共通テーマランキング"],
+                    width="stretch",
+                    hide_index=True,
+                )
+                st.dataframe(
+                    question_analysis["科目間共通テーマ行列"],
+                    width="stretch",
+                    hide_index=True,
+                )
+                st.dataframe(
+                    question_analysis["中項目間の共通テーマネットワーク"],
+                    width="stretch",
+                    hide_index=True,
+                )
+                st.dataframe(
+                    question_analysis["共通テーマ年度別推移"],
+                    width="stretch",
+                    hide_index=True,
+                )
+                st.subheader("複数科目の知識が必要と確認された問題")
+                st.dataframe(
+                    question_analysis["科目横断が必要な確認済み問題"],
+                    width="stretch",
+                    hide_index=True,
+                )
+                st.dataframe(
+                    question_analysis["科目横断必須問題数行列"],
+                    width="stretch",
+                    hide_index=True,
+                )
+                st.dataframe(
+                    question_analysis["科目横断必須の年度別推移"],
+                    width="stretch",
+                    hide_index=True,
+                )
+                export_col1, export_col2 = st.columns(2)
+                export_col1.download_button(
+                    "分類・出題構造をExcelでダウンロード",
+                    an.to_excel_bytes(question_analysis),
+                    "問題形式・出題構造分析.xlsx",
+                )
+                export_col2.download_button(
+                    "分類・出題構造をMarkdownでダウンロード",
+                    an.to_markdown(question_analysis),
+                    "問題形式・出題構造分析.md",
+                )
+            elif question_analysis:
+                st.info("分析条件または入力データが変わりました。再集計してください。")
 
 with tab_standard:
     st.caption(
