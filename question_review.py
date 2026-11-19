@@ -13,6 +13,7 @@ from typing import Optional
 import pandas as pd
 
 import repeats
+import terms
 
 
 FORMATS = [
@@ -40,6 +41,9 @@ ANNOTATION_STATUSES = [
 ]
 CONFIRMED_STATUSES = ("人間確認済み", "修正済み")
 CHOICE_COLUMNS = ["選択肢1", "選択肢2", "選択肢3", "選択肢4"]
+THEME_MIN_COMPARISON_ROUNDS = 3
+THEME_TREND_THRESHOLD_PP = 10.0
+UNCLASSIFIED_MIDDLE_LABELS = {"", "記載なし"}
 ANNOTATION_FIELDS = [
     "problem_id", "exam_round", "subject", "major", "middle", "problem_number",
     "content_hash", "question_json", "active", "suggested_format",
@@ -63,6 +67,36 @@ def _text(value) -> str:
 
 def _normalized(value) -> str:
     return re.sub(r"\s+", "", unicodedata.normalize("NFKC", _text(value)))
+
+
+def _theme_identity(category: str, label: str) -> str:
+    return json.dumps(
+        [category, _normalized(label)],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _active_theme_aliases(connection) -> dict[str, dict]:
+    return {
+        row["alias_key"]: _row_dict(row)
+        for row in connection.execute(
+            "SELECT * FROM theme_aliases WHERE active=1"
+        ).fetchall()
+    }
+
+
+def _resolve_theme_label(category: str, label: str, aliases: dict[str, dict]) -> str:
+    current = _text(label)
+    visited = set()
+    while True:
+        key = _theme_identity(category, current)
+        if key not in aliases:
+            return current
+        if key in visited:
+            raise ValueError("テーマの表記統合ルールに循環参照があります。")
+        visited.add(key)
+        current = aliases[key]["canonical_label"]
 
 
 def _format_suggestion(question: dict) -> tuple[Optional[str], list[str], str]:
@@ -196,6 +230,23 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
             updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS theme_aliases (
+            alias_key TEXT PRIMARY KEY,
+            category TEXT NOT NULL,
+            alias_label TEXT NOT NULL,
+            canonical_label TEXT NOT NULL,
+            rationale TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS theme_alias_history (
+            history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alias_key TEXT NOT NULL,
+            previous_json TEXT,
+            new_json TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            changed_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS question_annotations_subject_round_idx
             ON question_annotations (subject, exam_round, active);
@@ -476,6 +527,226 @@ def get_review_scope(database_path) -> dict[str, list]:
     }
 
 
+def _confirmed_theme_labels(connection) -> list[dict[str, str]]:
+    rows = connection.execute(
+        """
+        SELECT themes_json FROM question_annotations
+        WHERE active=1 AND theme_status IN (?, ?)
+        ORDER BY problem_id
+        """,
+        CONFIRMED_STATUSES,
+    ).fetchall()
+    labels = {}
+    for row in rows:
+        for theme in json.loads(row["themes_json"]):
+            key = _theme_identity(theme["category"], theme["label"])
+            labels.setdefault(key, {
+                "category": theme["category"],
+                "label": theme["label"],
+            })
+    return sorted(labels.values(), key=lambda theme: (theme["category"], theme["label"]))
+
+
+def list_confirmed_theme_labels(database_path) -> pd.DataFrame:
+    with _database(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT problem_id, themes_json FROM question_annotations
+            WHERE active=1 AND theme_status IN (?, ?)
+            ORDER BY problem_id
+            """,
+            CONFIRMED_STATUSES,
+        ).fetchall()
+    grouped = {}
+    for row in rows:
+        for theme in json.loads(row["themes_json"]):
+            key = _theme_identity(theme["category"], theme["label"])
+            item = grouped.setdefault(
+                key,
+                {
+                    "区分": theme["category"],
+                    "テーマ名": theme["label"],
+                    "問題ID": set(),
+                },
+            )
+            item["問題ID"].add(row["problem_id"])
+    return pd.DataFrame([
+        {
+            "区分": value["区分"],
+            "テーマ名": value["テーマ名"],
+            "問題数": len(value["問題ID"]),
+            "問題ID": "、".join(sorted(value["問題ID"])),
+        }
+        for value in sorted(
+            grouped.values(), key=lambda item: (item["区分"], item["テーマ名"])
+        )
+    ], columns=["区分", "テーマ名", "問題数", "問題ID"])
+
+
+def list_theme_aliases(database_path) -> pd.DataFrame:
+    with _database(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT category, alias_label, canonical_label, rationale, updated_at
+            FROM theme_aliases
+            WHERE active=1
+            ORDER BY category, alias_label
+            """
+        ).fetchall()
+    return pd.DataFrame(
+        [dict(row) for row in rows],
+        columns=["category", "alias_label", "canonical_label", "rationale", "updated_at"],
+    )
+
+
+def save_theme_alias(
+    database_path,
+    category: str,
+    alias_label: str,
+    canonical_label: str,
+    rationale: str,
+) -> bool:
+    category = _text(category)
+    alias_label = _text(alias_label)
+    canonical_label = _text(canonical_label)
+    rationale = _text(rationale)
+    if category not in THEME_DOMAINS:
+        raise ValueError("テーマ区分の指定が不正です。")
+    if not alias_label or not canonical_label or not rationale:
+        raise ValueError("統合前テーマ・統合先テーマ・判断根拠を入力してください。")
+    alias_key = _theme_identity(category, alias_label)
+    canonical_key = _theme_identity(category, canonical_label)
+    if alias_key == canonical_key:
+        raise ValueError("統合前と統合先のテーマ名が同じです。")
+
+    now = datetime.now(timezone.utc).isoformat()
+    with _database(database_path) as connection:
+        known_canonical_keys = {
+            _theme_identity(theme["category"], theme["label"])
+            for theme in _confirmed_theme_labels(connection)
+        }
+        if canonical_key not in known_canonical_keys:
+            raise ValueError("統合先は人が確認済みのテーマから選んでください。")
+
+        old_row = connection.execute(
+            "SELECT * FROM theme_aliases WHERE alias_key=?",
+            (alias_key,),
+        ).fetchone()
+        before = _row_dict(old_row) if old_row else None
+        after = {
+            "alias_key": alias_key,
+            "category": category,
+            "alias_label": alias_label,
+            "canonical_label": canonical_label,
+            "rationale": rationale,
+            "active": 1,
+            "updated_at": now,
+        }
+        aliases = _active_theme_aliases(connection)
+        aliases[alias_key] = after
+        _resolve_theme_label(category, alias_label, aliases)
+        if before and all(
+            before.get(field) == after[field]
+            for field in ("category", "alias_label", "canonical_label", "rationale", "active")
+        ):
+            return False
+
+        connection.execute(
+            """
+            INSERT INTO theme_aliases
+                (alias_key, category, alias_label, canonical_label, rationale, active, updated_at)
+            VALUES (?, ?, ?, ?, ?, 1, ?)
+            ON CONFLICT(alias_key) DO UPDATE SET
+                category=excluded.category,
+                alias_label=excluded.alias_label,
+                canonical_label=excluded.canonical_label,
+                rationale=excluded.rationale,
+                active=1,
+                updated_at=excluded.updated_at
+            """,
+            (alias_key, category, alias_label, canonical_label, rationale, now),
+        )
+        connection.execute(
+            """
+            INSERT INTO theme_alias_history
+                (alias_key, previous_json, new_json, reason, changed_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                alias_key,
+                json.dumps(before, ensure_ascii=False, sort_keys=True) if before else None,
+                json.dumps(after, ensure_ascii=False, sort_keys=True),
+                "人によるテーマ表記統合",
+                now,
+            ),
+        )
+    return True
+
+
+def remove_theme_alias(database_path, category: str, alias_label: str) -> bool:
+    alias_key = _theme_identity(category, alias_label)
+    now = datetime.now(timezone.utc).isoformat()
+    with _database(database_path) as connection:
+        old_row = connection.execute(
+            "SELECT * FROM theme_aliases WHERE alias_key=? AND active=1",
+            (alias_key,),
+        ).fetchone()
+        if old_row is None:
+            return False
+        before = _row_dict(old_row)
+        after = {**before, "active": 0, "updated_at": now}
+        connection.execute(
+            "UPDATE theme_aliases SET active=0, updated_at=? WHERE alias_key=?",
+            (now, alias_key),
+        )
+        connection.execute(
+            """
+            INSERT INTO theme_alias_history
+                (alias_key, previous_json, new_json, reason, changed_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                alias_key,
+                json.dumps(before, ensure_ascii=False, sort_keys=True),
+                json.dumps(after, ensure_ascii=False, sort_keys=True),
+                "人によるテーマ表記統合の解除",
+                now,
+            ),
+        )
+    return True
+
+
+def list_theme_alias_history(database_path, limit: int = 500) -> pd.DataFrame:
+    if limit < 1:
+        raise ValueError("履歴表示件数は1以上にしてください。")
+    with _database(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT history_id, previous_json, new_json, reason, changed_at
+            FROM theme_alias_history
+            ORDER BY history_id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    history = []
+    for row in rows:
+        before = json.loads(row["previous_json"]) if row["previous_json"] else {}
+        after = json.loads(row["new_json"])
+        history.append({
+            "履歴ID": row["history_id"],
+            "変更日時": row["changed_at"],
+            "変更理由": row["reason"],
+            "区分": after.get("category", before.get("category", "")),
+            "表記ゆれ・同義語": after.get("alias_label", before.get("alias_label", "")),
+            "変更前統合先": before.get("canonical_label", ""),
+            "変更後統合先": after.get("canonical_label", ""),
+            "変更後根拠": after.get("rationale", ""),
+            "有効": bool(after.get("active", False)),
+        })
+    return pd.DataFrame(history)
+
+
 def list_review_questions(
     database_path,
     subject: Optional[str] = None,
@@ -610,10 +881,8 @@ def save_annotation(database_path, problem_id: str, values: dict) -> bool:
         not knowledge_level or not rationale_values["knowledge"]
     ):
         raise ValueError("知識要求レベル・根拠を入力してください。")
-    if theme_status in CONFIRMED_STATUSES and (
-        not themes or not rationale_values["theme"]
-    ):
-        raise ValueError("確認済みテーマと根拠を入力してください。")
+    if theme_status in CONFIRMED_STATUSES and not rationale_values["theme"]:
+        raise ValueError("テーマ分類またはテーマなしの確認根拠を入力してください。")
     required = values.get("cross_subject_required")
     if required not in (None, True, False):
         raise ValueError("科目横断の必要性は必要・不要・未判定から選んでください。")
@@ -790,6 +1059,7 @@ def list_annotation_history(
 
 def _decode_row(row) -> dict:
     record = _row_dict(row)
+    record["question"] = json.loads(record.pop("question_json"))
     record["themes"] = json.loads(record.pop("themes_json"))
     record["related_subjects"] = json.loads(record.pop("related_subjects_json"))
     record["format_secondary"] = json.loads(record.pop("format_secondary_json"))
@@ -911,6 +1181,7 @@ def build_question_analysis(
         all_rows = connection.execute(
             "SELECT * FROM question_annotations WHERE active=1"
         ).fetchall()
+        theme_aliases = _active_theme_aliases(connection)
     decoded = [_decode_row(row) for row in all_rows]
     all_period_records = [
         row for row in decoded
@@ -1006,14 +1277,23 @@ def build_question_analysis(
         if row["theme_status"] not in CONFIRMED_STATUSES:
             continue
         for theme in row["themes"]:
-            key = (theme["category"], theme["label"])
-            theme_groups.setdefault(key, {}).setdefault(row["subject"], []).append(row)
+            label = _resolve_theme_label(
+                theme["category"], theme["label"], theme_aliases
+            )
+            key = (theme["category"], _normalized(label))
+            group = theme_groups.setdefault(
+                key, {"label": label, "subjects": {}}
+            )
+            group["label"] = min(group["label"], label)
+            group["subjects"].setdefault(row["subject"], []).append(row)
 
     theme_rank_rows = []
     theme_year_rows = []
     theme_subject_edges = {}
     item_edges = {}
-    for (domain, label), subject_groups in sorted(theme_groups.items()):
+    for (domain, _), group in sorted(theme_groups.items()):
+        label = group["label"]
+        subject_groups = group["subjects"]
         distinct_subjects = sorted(subject_groups)
         total_rows = [row for grouped in subject_groups.values() for row in grouped]
         if len(distinct_subjects) < 2:
@@ -1170,6 +1450,7 @@ def build_question_analysis(
         {"項目": "分類・知識レベルの科目フィルター", "内容": subject_filter},
         {"項目": "分類・知識レベルの対象問題数", "内容": str(len(classification_records))},
         {"項目": "テーマ・科目横断分析の全科目対象問題数", "内容": str(len(all_period_records))},
+        {"項目": "有効なテーマ表記統合ルール数", "内容": str(len(theme_aliases))},
         {"項目": "問題形式構成比の分母", "内容": f"形式の人間確認済み・修正済み問題数 {confirmed_format_count}"},
         {"項目": "知識レベル構成比の分母", "内容": f"知識レベルの人間確認済み・修正済み問題数 {confirmed_level_count}"},
         {"項目": "テーマ分析の対象", "内容": "全科目の人間確認済み・修正済みテーマ（問題IDと根拠を保持）"},
@@ -1243,9 +1524,387 @@ def build_question_analysis(
         ),
         "中項目間の共通テーマネットワーク": pd.DataFrame(theme_network_rows),
         "共通テーマ年度別推移": pd.DataFrame(theme_year_rows),
+        "テーマ表記統合ルール": pd.DataFrame([
+            {
+                "テーマ区分": alias["category"],
+                "統合前の表記": alias["alias_label"],
+                "統合先テーマ": alias["canonical_label"],
+                "判断根拠": alias["rationale"],
+            }
+            for alias in sorted(
+                theme_aliases.values(),
+                key=lambda item: (item["category"], item["alias_label"]),
+            )
+        ], columns=[
+            "テーマ区分", "統合前の表記", "統合先テーマ", "判断根拠"
+        ]),
         "科目横断が必要な確認済み問題": pd.DataFrame(cross_required_rows),
         "科目横断必須問題数行列": _matrix(
             cross_subjects, required_matrix_edges
         ),
         "科目横断必須の年度別推移": pd.DataFrame(required_yearly),
+    }
+
+
+def _theme_candidate_vocabulary() -> tuple[list[str], set[str]]:
+    root = Path(__file__).parent
+    dictionary = json.loads((root / "dictionary.json").read_text(encoding="utf-8"))
+    important_terms = dictionary.get("重要語(疾患・所見)", {})
+    curated = []
+    medical_terms_path = root / "medical_terms.txt"
+    if medical_terms_path.exists():
+        curated.extend(
+            line.strip()
+            for line in medical_terms_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+    curated.extend(important_terms)
+    stop = {
+        terms.norm(word)
+        for word in dictionary.get("除外語", [])
+        if terms.norm(word)
+    }
+    return curated, stop
+
+
+def _extract_theme_candidates(
+    records: list[dict],
+    candidate_limit: int = 10,
+    curated: Optional[list[str]] = None,
+    stop: Optional[set[str]] = None,
+) -> pd.DataFrame:
+    columns = [
+        "科目", "大項目", "中項目", "順位", "語句候補", "出現問題数",
+        "対象問題数", "問題ID", "候補状態", "抽出上の注意",
+    ]
+    if candidate_limit < 1:
+        raise ValueError("テーマ候補の表示数は1以上にしてください。")
+    usable_records = [
+        row for row in records
+        if row["middle"] not in UNCLASSIFIED_MIDDLE_LABELS
+    ]
+    if not usable_records:
+        return pd.DataFrame(columns=columns)
+    if curated is None or stop is None:
+        default_curated, default_stop = _theme_candidate_vocabulary()
+        curated = default_curated if curated is None else curated
+        stop = default_stop if stop is None else stop
+
+    question_groups = {}
+    for row in usable_records:
+        key = (row["subject"], row["major"])
+        question = row["question"]
+        choices = question.get("選択肢", [])
+        question_record = {
+            "回": row["exam_round"],
+            "問題ID": row["problem_id"],
+            "大項目": row["major"],
+            "中項目": row["middle"],
+            "問題": question.get("問題", ""),
+            "模範解答": question.get("模範解答", ""),
+            "正答": question.get("正答", ""),
+        }
+        question_record.update({
+            f"選択肢{index}": choices[index - 1] if index <= len(choices) else ""
+            for index in range(1, len(CHOICE_COLUMNS) + 1)
+        })
+        question_groups.setdefault(key, []).append(question_record)
+
+    result = []
+    for (subject, major), group_records in sorted(question_groups.items()):
+        questions = pd.DataFrame(group_records)
+        middle_items = sorted(questions["中項目"].dropna().astype(str).unique())
+        exact_stop = {terms.norm(major), *(terms.norm(item) for item in middle_items)}
+        candidates = terms.topic_frequent_terms(
+            questions,
+            middle_items,
+            curated,
+            stop,
+            exact_stop,
+            top=candidate_limit,
+        )
+        for candidate in candidates.to_dict(orient="records"):
+            result.append({
+                "科目": subject,
+                "大項目": major,
+                "中項目": candidate["中項目"],
+                "順位": candidate["順位"],
+                "語句候補": candidate["語"],
+                "出現問題数": candidate["出現問題数"],
+                "対象問題数": candidate["対象問題数"],
+                "問題ID": candidate["問題ID"],
+                "候補状態": "未確認候補",
+                "抽出上の注意": (
+                    "問題文・全選択肢の頻出語。誤答にも現れ、問題の主題とは限らない。"
+                ),
+            })
+    return pd.DataFrame(result, columns=columns)
+
+
+def _theme_trend_status(
+    has_past: bool,
+    has_recent: bool,
+    past_coverage: int,
+    recent_coverage: int,
+    delta_pp: Optional[float],
+) -> str:
+    if not has_past and not has_recent:
+        return "比較保留（完全レビュー済み回での出題なし）"
+    if has_past and has_recent:
+        if (
+            past_coverage < THEME_MIN_COMPARISON_ROUNDS
+            or recent_coverage < THEME_MIN_COMPARISON_ROUNDS
+        ):
+            return "継続（比較データ不足）"
+        if delta_pp is not None and delta_pp >= THEME_TREND_THRESHOLD_PP:
+            return "増加"
+        if delta_pp is not None and delta_pp <= -THEME_TREND_THRESHOLD_PP:
+            return "減少"
+        return "継続（横ばい）"
+    if past_coverage < THEME_MIN_COMPARISON_ROUNDS:
+        return "比較保留（過去期間のレビュー回数不足）"
+    if recent_coverage < THEME_MIN_COMPARISON_ROUNDS:
+        return "比較保留（直近期間のレビュー回数不足）"
+    if has_recent and not has_past:
+        return "新出候補"
+    if has_past and not has_recent:
+        return "減少（直近期間に出題なし）"
+    return "比較保留"
+
+
+def build_theme_change_analysis(
+    database_path,
+    period_start: int,
+    period_end: int,
+    candidate_limit: int = 10,
+) -> dict[str, pd.DataFrame]:
+    if period_start > period_end:
+        raise ValueError("分析開始回は終了回以前にしてください。")
+    if candidate_limit < 1:
+        raise ValueError("テーマ候補の表示数は1以上にしてください。")
+    with _database(database_path) as connection:
+        rows = connection.execute(
+            "SELECT * FROM question_annotations WHERE active=1"
+        ).fetchall()
+        aliases = _active_theme_aliases(connection)
+
+    records = [_decode_row(row) for row in rows]
+    period_records = [
+        row for row in records
+        if period_start <= row["exam_round"] <= period_end
+    ]
+    topic_records = [
+        row for row in period_records
+        if row["middle"] not in UNCLASSIFIED_MIDDLE_LABELS
+    ]
+    latest_round = max(
+        (row["exam_round"] for row in period_records), default=period_end
+    )
+    recent_start = max(period_start, latest_round - 9)
+    past_end = recent_start - 1
+    recent_end = latest_round
+    item_round_data = {}
+    item_theme_labels = {}
+    for row in topic_records:
+        item_key = (row["subject"], row["major"], row["middle"])
+        year_data = item_round_data.setdefault(item_key, {}).setdefault(
+            row["exam_round"],
+            {"all_ids": set(), "reviewed_ids": set(), "themes": {}},
+        )
+        year_data["all_ids"].add(row["problem_id"])
+        if row["theme_status"] not in CONFIRMED_STATUSES:
+            continue
+        year_data["reviewed_ids"].add(row["problem_id"])
+        for theme in row["themes"]:
+            canonical_label = _resolve_theme_label(
+                theme["category"], theme["label"], aliases
+            )
+            theme_key = (theme["category"], _normalized(canonical_label))
+            label_map = item_theme_labels.setdefault(item_key, {})
+            label_map[theme_key] = min(
+                label_map.get(theme_key, canonical_label), canonical_label
+            )
+            year_data["themes"].setdefault(theme_key, set()).add(row["problem_id"])
+
+    annual_rows = []
+    trend_rows = []
+    for item_key in sorted(item_round_data):
+        subject, major, middle = item_key
+        year_map = item_round_data[item_key]
+        labels = item_theme_labels.get(item_key, {})
+        complete_rounds = {
+            year for year, year_data in year_map.items()
+            if year_data["all_ids"]
+            and year_data["reviewed_ids"] == year_data["all_ids"]
+        }
+        covered_past_rounds = sorted(
+            year for year in complete_rounds if period_start <= year <= past_end
+        )
+        covered_recent_rounds = sorted(
+            year for year in complete_rounds if recent_start <= year <= recent_end
+        )
+
+        for year in sorted(year_map):
+            year_data = year_map[year]
+            review_complete = (
+                bool(year_data["all_ids"])
+                and year_data["reviewed_ids"] == year_data["all_ids"]
+            )
+            for theme_key, label in sorted(labels.items()):
+                tagged_ids = year_data["themes"].get(theme_key, set())
+                annual_rows.append({
+                    "科目": subject,
+                    "大項目": major,
+                    "中項目": middle,
+                    "回": year,
+                    "テーマ区分": theme_key[0],
+                    "テーマ": label,
+                    "テーマ表示名": f"{theme_key[0]}：{label}",
+                    "テーマ確認状態": (
+                        "全問題を確認済み" if review_complete else "未完了"
+                    ),
+                    "対象問題数": len(year_data["all_ids"]),
+                    "テーマ確認済み問題数": len(year_data["reviewed_ids"]),
+                    "テーマ出題問題数": len(tagged_ids) if review_complete else None,
+                    "テーマ出題割合(%)": (
+                        round(len(tagged_ids) / len(year_data["all_ids"]) * 100, 1)
+                        if review_complete else None
+                    ),
+                    "問題ID": "、".join(sorted(tagged_ids)),
+                })
+
+        for theme_key, label in sorted(labels.items()):
+            past_theme_rounds = [
+                year for year in covered_past_rounds
+                if year_map[year]["themes"].get(theme_key)
+            ]
+            recent_theme_rounds = [
+                year for year in covered_recent_rounds
+                if year_map[year]["themes"].get(theme_key)
+            ]
+            past_ids = {
+                problem_id for year in past_theme_rounds
+                for problem_id in year_map[year]["themes"][theme_key]
+            }
+            recent_ids = {
+                problem_id for year in recent_theme_rounds
+                for problem_id in year_map[year]["themes"][theme_key]
+            }
+            past_share = (
+                len(past_theme_rounds) / len(covered_past_rounds) * 100
+                if covered_past_rounds else None
+            )
+            recent_share = (
+                len(recent_theme_rounds) / len(covered_recent_rounds) * 100
+                if covered_recent_rounds else None
+            )
+            delta = (
+                round(recent_share - past_share, 1)
+                if recent_share is not None and past_share is not None else None
+            )
+            trend_rows.append({
+                "科目": subject,
+                "大項目": major,
+                "中項目": middle,
+                "テーマ区分": theme_key[0],
+                "テーマ": label,
+                "過去期間": (
+                    f"第{period_start}〜{past_end}回"
+                    if past_end >= period_start else "比較期間なし"
+                ),
+                "直近期間": f"第{recent_start}〜{recent_end}回",
+                "過去の完全レビュー済み回数": len(covered_past_rounds),
+                "直近の完全レビュー済み回数": len(covered_recent_rounds),
+                "過去の出題回数": len(past_theme_rounds),
+                "直近の出題回数": len(recent_theme_rounds),
+                "過去の出題問題数": len(past_ids),
+                "直近の出題問題数": len(recent_ids),
+                "過去の出題回割合(%)": round(past_share, 1) if past_share is not None else None,
+                "直近の出題回割合(%)": round(recent_share, 1) if recent_share is not None else None,
+                "出題回割合の差(ポイント)": delta,
+                "変化判定": (
+                    "比較期間なし"
+                    if past_end < period_start
+                    else _theme_trend_status(
+                        bool(past_ids), bool(recent_ids),
+                        len(covered_past_rounds), len(covered_recent_rounds), delta,
+                    )
+                ),
+                "過去の問題ID": "、".join(sorted(past_ids)),
+                "直近の問題ID": "、".join(sorted(recent_ids)),
+            })
+
+    trend_frame = pd.DataFrame(trend_rows)
+    empty_middle_rows = [
+        {
+            "問題ID": row["problem_id"],
+            "回": row["exam_round"],
+            "科目": row["subject"],
+            "大項目": row["major"],
+            "中項目": row["middle"],
+        }
+        for row in period_records
+        if row["middle"] in UNCLASSIFIED_MIDDLE_LABELS
+    ]
+    candidate_terms = _extract_theme_candidates(
+        period_records, candidate_limit=candidate_limit
+    )
+    alias_frame = pd.DataFrame([
+        {
+            "テーマ区分": alias["category"],
+            "統合前の表記": alias["alias_label"],
+            "統合先テーマ": alias["canonical_label"],
+            "判断根拠": alias["rationale"],
+        }
+        for alias in sorted(
+            aliases.values(),
+            key=lambda item: (item["category"], item["alias_label"]),
+        )
+    ], columns=["テーマ区分", "統合前の表記", "統合先テーマ", "判断根拠"])
+    confirmed_topic_count = sum(
+        row["theme_status"] in CONFIRMED_STATUSES for row in topic_records
+    )
+    unclassified_middle_count = sum(
+        row["middle"] in UNCLASSIFIED_MIDDLE_LABELS for row in period_records
+    )
+    conditions = pd.DataFrame([
+        {"項目": "対象回", "内容": f"第{period_start}〜{period_end}回"},
+        {"項目": "直近期間", "内容": f"第{recent_start}〜{recent_end}回（最大10回）"},
+        {"項目": "過去期間", "内容": f"第{period_start}〜{past_end}回" if past_end >= period_start else "比較期間なし"},
+        {"項目": "期間内の対象問題数", "内容": str(len(period_records))},
+        {"項目": "中項目分類済み問題数", "内容": str(len(topic_records))},
+        {"項目": "テーマ確認済み問題数", "内容": str(confirmed_topic_count)},
+        {"項目": "中項目未設定・記載なしの問題数", "内容": str(unclassified_middle_count)},
+        {"項目": "対象", "内容": "中項目が分類済みの過去問。中項目「記載なし」は別表"},
+        {"項目": "テーマの出題数", "内容": "人間確認済み・修正済みテーマを問題ID単位で集計"},
+        {"項目": "年度別出題割合の分母", "内容": "該当する中項目・出題回の全問題数"},
+        {"項目": "期間比較の出題回割合の分母", "内容": "各期間でテーマ確認が完了した出題回数"},
+        {"項目": "年度比較の収録条件", "内容": "その中項目・出題回の全問題でテーマ確認が完了した回のみ比較に使用"},
+        {"項目": "増減判定", "内容": f"両期間に完全レビュー済み回が各{THEME_MIN_COMPARISON_ROUNDS}回以上ある場合、出題回割合の差{THEME_TREND_THRESHOLD_PP:g}ポイント以上を増減と判定"},
+        {"項目": "テーマ語句候補", "内容": f"既存の頻出語抽出を再利用し、中項目ごとに上位{candidate_limit}語。未確認候補として提示し、確定テーマには含めない"},
+        {"項目": "候補抽出の注意", "内容": "問題文・全選択肢を対象とし、誤答にも現れる語句を含む。人の確認が必要"},
+        {"項目": "表記ゆれ", "内容": "NFKC・空白除去で正規化し、同義語は人が登録した統合ルールのみ適用"},
+    ])
+    decrease = trend_frame.loc[
+        trend_frame["変化判定"].str.startswith("減少")
+    ].reset_index(drop=True) if not trend_frame.empty else trend_frame.copy()
+    newly_appeared = trend_frame.loc[
+        trend_frame["変化判定"].eq("新出候補")
+    ].reset_index(drop=True) if not trend_frame.empty else trend_frame.copy()
+    continuous = trend_frame.loc[
+        trend_frame["変化判定"].str.startswith("継続")
+    ].reset_index(drop=True) if not trend_frame.empty else trend_frame.copy()
+    return {
+        "テーマ変化分析条件": conditions,
+        "中項目別テーマ頻度比較": trend_frame,
+        "新出テーマ候補": newly_appeared,
+        "減少テーマ候補": decrease,
+        "継続テーマ": continuous,
+        "年度別テーマ出現頻度": pd.DataFrame(annual_rows),
+        "テーマ語句候補（未確認）": candidate_terms,
+        "中項目未設定問題": pd.DataFrame(
+            empty_middle_rows,
+            columns=["問題ID", "回", "科目", "大項目", "中項目"],
+        ),
+        "テーマ表記統合ルール": alias_frame,
     }

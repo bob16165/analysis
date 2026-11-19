@@ -551,6 +551,101 @@ with tab_question_review:
             hide_index=True,
         )
 
+    if review_database.exists():
+        with st.expander("テーマ表記ゆれ・同義語の統合", expanded=False):
+            st.caption(
+                "全角・半角と空白の違いは正規化します。同義語の統合は人が根拠を確認して登録し、"
+                "変更・解除の履歴を保存します。"
+            )
+            confirmed_theme_labels = qr.list_confirmed_theme_labels(review_database)
+            if confirmed_theme_labels.empty:
+                st.info("統合先に使える人間確認済みテーマがありません。先にテーマを分類してください。")
+            else:
+                alias_domains = sorted(confirmed_theme_labels["区分"].unique())
+                with st.form("theme_alias_form"):
+                    alias_domain = st.selectbox(
+                        "テーマ区分",
+                        alias_domains,
+                        key="theme_alias_domain",
+                    )
+                    canonical_options = sorted(
+                        confirmed_theme_labels.loc[
+                            confirmed_theme_labels["区分"].eq(alias_domain),
+                            "テーマ名",
+                        ].unique()
+                    )
+                    canonical_theme = st.selectbox(
+                        "統合先の確認済みテーマ",
+                        canonical_options,
+                        key="theme_alias_canonical",
+                    )
+                    alias_label = st.text_input(
+                        "統合する表記・同義語",
+                        key="theme_alias_label",
+                    )
+                    alias_rationale = st.text_area(
+                        "同じテーマと判断した根拠",
+                        key="theme_alias_rationale",
+                    )
+                    alias_submitted = st.form_submit_button("表記統合を保存")
+                if alias_submitted:
+                    try:
+                        alias_changed = qr.save_theme_alias(
+                            review_database,
+                            alias_domain,
+                            alias_label,
+                            canonical_theme,
+                            alias_rationale,
+                        )
+                    except ValueError as exc:
+                        st.error(str(exc))
+                    else:
+                        if alias_changed:
+                            st.session_state.pop("question_analysis_result", None)
+                            st.session_state.pop("question_analysis_key", None)
+                        st.success(
+                            "表記統合を保存しました。" if alias_changed
+                            else "表記統合に変更はありません。"
+                        )
+
+            active_theme_aliases = qr.list_theme_aliases(review_database)
+            if not active_theme_aliases.empty:
+                st.dataframe(
+                    active_theme_aliases, width="stretch", hide_index=True
+                )
+                alias_options = active_theme_aliases.to_dict(orient="records")
+                selected_alias_label = st.selectbox(
+                    "解除する統合ルール",
+                    [
+                        f"{row['category']}: {row['alias_label']} → "
+                        f"{row['canonical_label']}"
+                        for row in alias_options
+                    ],
+                    key="theme_alias_to_remove",
+                )
+                selected_alias = next(
+                    row for row in alias_options
+                    if (
+                        f"{row['category']}: {row['alias_label']} → "
+                        f"{row['canonical_label']}"
+                    ) == selected_alias_label
+                )
+                if st.button("選択した表記統合を解除", key="theme_alias_remove"):
+                    qr.remove_theme_alias(
+                        review_database,
+                        selected_alias["category"],
+                        selected_alias["alias_label"],
+                    )
+                    st.session_state.pop("question_analysis_result", None)
+                    st.session_state.pop("question_analysis_key", None)
+                    st.success("表記統合を解除し、履歴を保存しました。")
+            with st.expander("テーマ表記統合の変更履歴"):
+                st.dataframe(
+                    qr.list_theme_alias_history(review_database),
+                    width="stretch",
+                    hide_index=True,
+                )
+
     if not review_database.exists():
         st.info("分類データはありません。過去問を同期してください。")
     else:
@@ -838,14 +933,20 @@ with tab_question_review:
                 if analysis_start > analysis_end:
                     st.error("開始回は終了回以前にしてください。")
                 else:
-                    st.session_state["question_analysis_result"] = (
-                        qr.build_question_analysis(
+                    question_analysis = qr.build_question_analysis(
+                        review_database,
+                        int(analysis_start),
+                        int(analysis_end),
+                        analysis_subject,
+                    )
+                    question_analysis.update(
+                        qr.build_theme_change_analysis(
                             review_database,
                             int(analysis_start),
                             int(analysis_end),
-                            analysis_subject,
                         )
                     )
+                    st.session_state["question_analysis_result"] = question_analysis
                     st.session_state["question_analysis_key"] = analysis_key
 
             question_analysis = st.session_state.get("question_analysis_result")
@@ -946,6 +1047,93 @@ with tab_question_review:
                     width="stretch",
                     hide_index=True,
                 )
+                st.subheader("中項目別のテーマ変化")
+                st.dataframe(
+                    question_analysis["テーマ変化分析条件"],
+                    width="stretch",
+                    hide_index=True,
+                )
+                st.caption(
+                    "テーマ頻度は人間確認済み・修正済みラベルだけで集計します。"
+                    "比較には中項目内の全問題を確認した出題回だけを使用し、"
+                    "各期間3回以上の完全レビュー済み回がある場合に、出題回割合の差±10ポイントで増減を判定します。"
+                )
+                theme_change = question_analysis["中項目別テーマ頻度比較"]
+                st.dataframe(theme_change, width="stretch", hide_index=True)
+                theme_change_tabs = st.tabs(
+                    ["新出候補", "減少候補", "継続テーマ"]
+                )
+                for theme_tab, key in zip(
+                    theme_change_tabs,
+                    ["新出テーマ候補", "減少テーマ候補", "継続テーマ"],
+                ):
+                    with theme_tab:
+                        st.dataframe(
+                            question_analysis[key],
+                            width="stretch",
+                            hide_index=True,
+                        )
+
+                annual_themes = question_analysis["年度別テーマ出現頻度"]
+                if not annual_themes.empty:
+                    theme_items = (
+                        annual_themes[["科目", "大項目", "中項目"]]
+                        .drop_duplicates()
+                        .sort_values(["科目", "大項目", "中項目"])
+                        .to_dict(orient="records")
+                    )
+                    theme_item_labels = {
+                        f"{item['科目']} | {item['大項目']} | {item['中項目']}": item
+                        for item in theme_items
+                    }
+                    selected_theme_item = st.selectbox(
+                        "年度推移を表示する中項目",
+                        list(theme_item_labels),
+                        key="theme_change_item",
+                    )
+                    selected_item = theme_item_labels[selected_theme_item]
+                    selected_annual_themes = annual_themes.loc[
+                        annual_themes["科目"].eq(selected_item["科目"])
+                        & annual_themes["大項目"].eq(selected_item["大項目"])
+                        & annual_themes["中項目"].eq(selected_item["中項目"])
+                    ]
+                    theme_chart = selected_annual_themes.pivot(
+                        index="回",
+                        columns="テーマ表示名",
+                        values="テーマ出題問題数",
+                    )
+                    st.line_chart(theme_chart)
+                    st.caption(
+                        "未完了の出題回は欠損値として表示します。完全レビュー済み回のみ0件を表示します。"
+                    )
+                    st.dataframe(
+                        selected_annual_themes,
+                        width="stretch",
+                        hide_index=True,
+                    )
+                with st.expander("未確認の語句候補（中項目別）"):
+                    st.caption(
+                        "既存の頻出語抽出で問題文・選択肢から候補を提示します。"
+                        "この表だけではテーマとして確定しません。問題IDをレビュー一覧で検索し、"
+                        "問題ごとに内容と根拠を確認してテーマを保存してください。"
+                    )
+                    st.dataframe(
+                        question_analysis["テーマ語句候補（未確認）"],
+                        width="stretch",
+                        hide_index=True,
+                    )
+                with st.expander("中項目が未設定・記載なしの問題"):
+                    st.dataframe(
+                        question_analysis["中項目未設定問題"],
+                        width="stretch",
+                        hide_index=True,
+                    )
+                with st.expander("分析で適用した表記統合ルール"):
+                    st.dataframe(
+                        question_analysis["テーマ表記統合ルール"],
+                        width="stretch",
+                        hide_index=True,
+                    )
                 st.subheader("複数科目の知識が必要と確認された問題")
                 st.dataframe(
                     question_analysis["科目横断が必要な確認済み問題"],
