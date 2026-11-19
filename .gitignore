@@ -1,2 +1,5 @@
 __pycache__/
 .DS_Store
+analysis_review.sqlite3
+analysis_review.sqlite3-shm
+analysis_review.sqlite3-wal

@@ -7,6 +7,8 @@ import streamlit as st
 
 import analysis as an
 import article
+import repeats as repeat_analysis
+import standard_history as sh
 import trends
 
 st.set_page_config(page_title="出題傾向分析", layout="wide")
@@ -42,8 +44,8 @@ if not (freq_file and past_file):
     st.info("2つのExcelを指定してください。")
     st.stop()
 
-tab_run, tab_search, tab_dict, tab_trend = st.tabs(
-    ["分析", "語句検索", "辞書の編集", "出題トレンド"]
+tab_run, tab_search, tab_dict, tab_trend, tab_repeats, tab_standard = st.tabs(
+    ["分析", "語句検索", "辞書の編集", "出題トレンド", "再出題・類題", "出題基準別実績"]
 )
 
 with tab_run:
@@ -137,6 +139,31 @@ with tab_run:
         c1, c2 = st.columns(2)
         c1.download_button("Excelをダウンロード", an.to_excel_bytes(result), "出題傾向分析.xlsx")
         c2.download_button("AIレポート用Markdown", an.to_markdown(result), "出題傾向分析.md")
+
+        st.subheader("note記事のたたき台")
+        st.caption(
+            "テンプレートを使った文章生成です。掲載前に文章、数値、問題の出典・正答、"
+            "権利関係を確認してください。問題文や選択肢の全文は記事に含めません。"
+        )
+        mea = st.text_area("MEAの紹介文（任意）", key="article_mea")
+        mock_results = st.text_area("自校の模試結果・集計条件（任意）", key="article_mock")
+        next_theme = st.text_input("次回の分析テーマ（任意）", key="article_next")
+        if st.button("記事のたたき台を作成"):
+            try:
+                st.session_state["article_draft"] = article.generate_article(
+                    result, mea=mea, next_theme=next_theme, mock_results=mock_results
+                )
+            except ValueError as e:
+                st.error(str(e))
+        if "article_draft" in st.session_state:
+            draft = st.text_area("記事本文（編集できます）", key="article_draft", height=600)
+            count = len(draft)
+            st.caption(f"文字数：{count:,}字（改行・記号を含む。目安：3,000〜4,000字）")
+            if not 3000 <= count <= 4000:
+                st.warning("文字数が目安の範囲外です。内容を確認し、必要に応じて編集してください。")
+            if "［" in draft and "］" in draft:
+                st.warning("未入力の項目があります。公開前に［　］内を入力してください。")
+            st.download_button("記事をMarkdownでダウンロード", draft, "note記事.md", mime="text/markdown")
 
 with tab_trend:
     st.caption(
@@ -276,30 +303,362 @@ with tab_trend:
             elif trend_result:
                 st.info("分析条件または入力データが変わりました。再分析してください。")
 
-        st.subheader("note記事のたたき台")
-        st.caption(
-            "テンプレートを使った文章生成です。掲載前に文章、数値、問題の出典・正答、"
-            "権利関係を確認してください。問題文や選択肢の全文は記事に含めません。"
+with tab_repeats:
+    review_database = APP_DIR / "analysis_review.sqlite3"
+    current_question_file_signature = file_signature(past_file)
+    st.caption(
+        "問題文・選択肢・模範解答・正答の正規化一致をA候補、文字3-gramで絞った文字列類似度"
+        f"（初期閾値{repeat_analysis.MIN_SIMILARITY:.2f}）をB候補として提示します。"
+        "類似度だけで同一問題・類題とは確定せず、人が確認した判定と履歴をSQLiteに保存します。"
+    )
+    st.warning(
+        "問題データを更新した場合は再同期してください。内容に変更があった問題に関係する判定は"
+        "再確認待ちとなり、人による判定は自動処理で上書きされません。"
+    )
+    if review_database.exists():
+        saved_signature = repeat_analysis.get_source_signature(review_database)
+        if saved_signature and saved_signature != current_question_file_signature:
+            st.warning("過去問.xlsxが前回同期時から変更されています。判定前に再同期してください。")
+        elif not saved_signature:
+            st.warning("前回同期したExcelを特定できません。最新データを同期してください。")
+    if st.button("過去問を同期して候補を抽出", type="primary"):
+        question_sheets = {
+            name: an.load_questions(past_file, name, 1, 999)
+            for name in an.sheet_names(past_file)
+        }
+        try:
+            sync_result = repeat_analysis.refresh_review_database(
+                review_database,
+                question_sheets,
+                source_signature=current_question_file_signature,
+            )
+            st.session_state["repeat_sync_result"] = sync_result
+        except ValueError as exc:
+            st.error(str(exc))
+
+    if "repeat_sync_result" in st.session_state:
+        st.subheader("直近の同期結果")
+        st.dataframe(
+            pd.DataFrame([st.session_state["repeat_sync_result"]]),
+            width="stretch",
+            hide_index=True,
         )
-        mea = st.text_area("MEAの紹介文（任意）", key="article_mea")
-        mock_results = st.text_area("自校の模試結果・集計条件（任意）", key="article_mock")
-        next_theme = st.text_input("次回の分析テーマ（任意）", key="article_next")
-        if st.button("記事のたたき台を作成"):
-            try:
-                st.session_state["article_draft"] = article.generate_article(
-                    result, mea=mea, next_theme=next_theme, mock_results=mock_results
+
+    if review_database.exists():
+        st.subheader("保存済みの候補と判定")
+        review_counts = repeat_analysis.get_review_counts(review_database)
+        if not review_counts.empty:
+            st.dataframe(review_counts, width="stretch", hide_index=True)
+        review_status = st.selectbox(
+            "表示する判定状態",
+            ["未確認・再確認待ち", *repeat_analysis.REVIEW_STATUSES, "全て"],
+            key="repeat_review_status",
+        )
+        review_offset = st.number_input(
+            "候補一覧の開始位置",
+            min_value=0,
+            max_value=100000,
+            value=0,
+            step=100,
+            key="repeat_review_offset",
+        )
+        candidates = repeat_analysis.list_review_candidates(
+            review_database, review_status, limit=100, offset=int(review_offset)
+        )
+        st.dataframe(candidates, width="stretch", hide_index=True)
+        repeat_export = {
+            "抽出条件": pd.DataFrame([
+                {"項目": "対象", "内容": "同期済みの全過去問"},
+                {"項目": "A候補", "内容": "正規化した問題文・選択肢・模範解答・正答が一致"},
+                {
+                    "項目": "B候補",
+                    "内容": (
+                        f"文字列類似度{repeat_analysis.MIN_SIMILARITY:.2f}以上、"
+                        f"本文共通3-gram{repeat_analysis.MIN_SHARED_NGRAMS}個以上、"
+                        f"問題文共通3-gram{repeat_analysis.MIN_SHARED_STEM_NGRAMS}個以上、"
+                        f"問題文類似度{repeat_analysis.MIN_STEM_SIMILARITY:.2f}以上"
+                    ),
+                },
+                {"項目": "表示状態", "内容": review_status},
+                {"項目": "表示開始位置", "内容": int(review_offset)},
+                {"項目": "表示件数上限", "内容": 100},
+                {"項目": "自動判定に関する注意", "内容": "候補は人が確認するまで確定扱いしない"},
+            ]),
+            "候補一覧（表示中）": candidates,
+            "問題データ変更履歴": repeat_analysis.list_question_changes(review_database),
+            "関係判定履歴": repeat_analysis.list_relation_history(review_database),
+        }
+        repeat_export_col1, repeat_export_col2 = st.columns(2)
+        repeat_export_col1.download_button(
+            "再出題・類題候補をExcelでダウンロード",
+            an.to_excel_bytes(repeat_export),
+            "再出題・類題候補.xlsx",
+        )
+        repeat_export_col2.download_button(
+            "再出題・類題候補をMarkdownでダウンロード",
+            an.to_markdown(repeat_export),
+            "再出題・類題候補.md",
+        )
+        if candidates.empty:
+            st.info("この条件の候補はありません。")
+        else:
+            candidate_by_id = {
+                row["relation_id"]: row for row in candidates.to_dict(orient="records")
+            }
+
+            def candidate_label(relation_id):
+                row = candidate_by_id[relation_id]
+                return (
+                    f"{row['question_id_a']} ⇄ {row['question_id_b']} / "
+                    f"{row['review_status']} / 自動候補 {row['auto_type'] or 'なし'}"
                 )
-            except ValueError as e:
-                st.error(str(e))
-        if "article_draft" in st.session_state:
-            draft = st.text_area("記事本文（編集できます）", key="article_draft", height=600)
-            count = len(draft)
-            st.caption(f"文字数：{count:,}字（改行・記号を含む。目安：3,000〜4,000字）")
-            if not 3000 <= count <= 4000:
-                st.warning("文字数が目安の範囲外です。内容を確認し、必要に応じて編集してください。")
-            if "［" in draft and "］" in draft:
-                st.warning("未入力の項目があります。公開前に［　］内を入力してください。")
-            st.download_button("記事をMarkdownでダウンロード", draft, "note記事.md", mime="text/markdown")
+
+            selected_relation_id = st.selectbox(
+                "確認する関係",
+                list(candidate_by_id),
+                format_func=candidate_label,
+                key="repeat_selected_relation",
+            )
+            detail = repeat_analysis.get_relation_detail(
+                review_database, selected_relation_id
+            )
+            relation = detail["relation"]
+            st.caption(
+                f"自動候補: {relation['auto_type'] or 'なし'} / "
+                f"類似度: {relation['similarity'] if relation['similarity'] is not None else '—'} / "
+                f"根拠: {relation['evidence']}"
+            )
+            for side_key, side_label in (("a", "問題A"), ("b", "問題B")):
+                side = detail[side_key]
+                with st.expander(f"{side_label}: {side['problem_id']}", expanded=True):
+                    if not side["active"]:
+                        st.warning("現在の入力データにはこの問題がありません。")
+                    if side["changed"] and side["previous"]:
+                        st.warning("前回確認時から問題内容が変更されています。")
+                        st.write("変更前", side["previous"])
+                    st.write("現在", side["current"])
+
+            review_options = ["未判定", *repeat_analysis.REVIEW_TYPES]
+            default_review = (
+                relation["reviewed_type"] or relation["auto_type"] or "未判定"
+            )
+            review_value = st.selectbox(
+                "人による判定（A:同一問題 / B:類似問題 / C:関連問題）",
+                review_options,
+                index=review_options.index(default_review),
+                key=f"repeat_review_type_{selected_relation_id}",
+            )
+            review_note = st.text_area(
+                "判定根拠・メモ",
+                value=relation["review_note"],
+                key=f"repeat_review_note_{selected_relation_id}",
+            )
+            if st.button("判定を保存", key=f"repeat_save_{selected_relation_id}"):
+                if review_value == "未判定":
+                    st.error("保存する判定を選択してください。")
+                else:
+                    repeat_analysis.save_relation_review(
+                        review_database, selected_relation_id, review_value, review_note
+                    )
+                    st.success("判定と履歴を保存しました。")
+
+        with st.expander("関連問題（C）を手動で追加"):
+            query = st.text_input(
+                "問題IDの一部で検索（例: 第28回/整形外科）",
+                key="repeat_manual_query",
+            )
+            st.dataframe(
+                repeat_analysis.list_current_questions(
+                    review_database, query=query, limit=100
+                ),
+                width="stretch",
+                hide_index=True,
+            )
+            manual_col_a, manual_col_b = st.columns(2)
+            manual_id_a = manual_col_a.text_input("問題ID A", key="repeat_manual_id_a")
+            manual_id_b = manual_col_b.text_input("問題ID B", key="repeat_manual_id_b")
+            manual_note = st.text_input("関連性の根拠", key="repeat_manual_note")
+            if st.button("C:関連問題として追加", key="repeat_add_manual"):
+                try:
+                    repeat_analysis.add_manual_related_pair(
+                        review_database, manual_id_a.strip(), manual_id_b.strip(), manual_note
+                    )
+                    st.success("関連問題と履歴を保存しました。")
+                except ValueError as exc:
+                    st.error(str(exc))
+
+        with st.expander("判定履歴"):
+            st.dataframe(
+                repeat_analysis.list_relation_history(review_database),
+                width="stretch",
+                hide_index=True,
+            )
+        with st.expander("問題データの変更前後"):
+            st.dataframe(
+                repeat_analysis.list_question_changes(review_database),
+                width="stretch",
+                hide_index=True,
+            )
+    else:
+        st.info("まだレビュー用データベースがありません。過去問を同期してください。")
+
+with tab_standard:
+    st.caption(
+        "「記載なし」を含む大項目・中項目は旧出題基準由来、それ以外は現行出題基準として扱います。"
+        "既存の分類・頻度集計は変更せず、頻度表または過去問で確認できた項目の実績を比較します。"
+        "頻度区分は対象期間の問題数、出題回数は異なる国家試験回の数です。"
+    )
+    st.info(
+        "公式出題基準の全項目が揃っていないため、公式基準全体に対する網羅率は算出しません。"
+        "以下の項目出題実績率の分母は、出題頻度表または過去問から確認できた項目数です。"
+    )
+    standard_subject = st.selectbox(
+        "科目", an.sheet_names(freq_file), key="standard_subject"
+    )
+    standard_freq, standard_year_columns = an.load_freq(freq_file, standard_subject)
+    standard_questions = an.load_questions(past_file, standard_subject, 1, 999)
+    expected_standard_rounds = [
+        int(column[1:-1]) for column in standard_year_columns
+    ]
+    if not expected_standard_rounds:
+        st.warning("出題頻度表に対象回の列がありません。")
+    else:
+        standard_col1, standard_col2, standard_col3 = st.columns(3)
+        standard_col4, standard_col5, standard_col6 = st.columns(3)
+        min_standard_round = min(expected_standard_rounds)
+        max_standard_round = max(expected_standard_rounds)
+        period_start = standard_col1.number_input(
+            "開始回",
+            min_value=min_standard_round,
+            max_value=max_standard_round,
+            value=min_standard_round,
+            key="standard_period_start",
+        )
+        period_end = standard_col2.number_input(
+            "終了回",
+            min_value=min_standard_round,
+            max_value=max_standard_round,
+            value=max_standard_round,
+            key="standard_period_end",
+        )
+        recent_count = standard_col3.number_input(
+            "直近の回数", min_value=1, max_value=40, value=10, key="standard_recent_count"
+        )
+        bin_first = standard_col4.number_input(
+            "第1区分の上限", min_value=1, max_value=100, value=1, key="standard_bin_first"
+        )
+        bin_second = standard_col5.number_input(
+            "第2区分の上限", min_value=2, max_value=100, value=3, key="standard_bin_second"
+        )
+        bin_third = standard_col6.number_input(
+            "第3区分の上限", min_value=3, max_value=100, value=5, key="standard_bin_third"
+        )
+        if st.button("出題基準区分別に集計", type="primary"):
+            if not (bin_first < bin_second < bin_third):
+                st.error("頻度区分の上限は小さい順に設定してください。")
+            elif period_start > period_end:
+                st.error("開始回は終了回以前にしてください。")
+            else:
+                standard_result = sh.analyze_standard_history(
+                    standard_questions,
+                    standard_freq,
+                    standard_subject,
+                    expected_standard_rounds,
+                    int(period_start),
+                    int(period_end),
+                    int(recent_count),
+                    (int(bin_first), int(bin_second), int(bin_third)),
+                )
+                st.session_state["standard_result"] = standard_result
+                st.session_state["standard_result_key"] = (
+                    file_signature(freq_file),
+                    file_signature(past_file),
+                    standard_subject,
+                    int(period_start),
+                    int(period_end),
+                    int(recent_count),
+                    int(bin_first),
+                    int(bin_second),
+                    int(bin_third),
+                )
+
+        current_standard_key = (
+            file_signature(freq_file),
+            file_signature(past_file),
+            standard_subject,
+            int(period_start),
+            int(period_end),
+            int(recent_count),
+            int(bin_first),
+            int(bin_second),
+            int(bin_third),
+        )
+        standard_result = st.session_state.get("standard_result")
+        if standard_result and st.session_state.get("standard_result_key") == current_standard_key:
+            st.subheader("出題基準区分別の実績")
+            st.dataframe(
+                standard_result["出題基準区分別集計"],
+                width="stretch",
+                hide_index=True,
+            )
+            standard_summary = standard_result["出題基準区分別集計"]
+            if not standard_summary.empty:
+                st.bar_chart(
+                    standard_summary.set_index("出題基準区分")[
+                        "対象期間の項目出題実績率(%)"
+                    ]
+                )
+            st.subheader("出題頻度区分別の項目数")
+            st.dataframe(
+                standard_result["出題頻度区分別集計"],
+                width="stretch",
+                hide_index=True,
+            )
+            frequency_chart = standard_result["出題頻度区分別集計"].pivot(
+                index="対象期間の出題頻度区分",
+                columns="出題基準区分",
+                values="項目数",
+            )
+            st.bar_chart(frequency_chart)
+            st.subheader("年度別の区分別出題")
+            annual_standard = standard_result["年度別の区分別出題"]
+            if not annual_standard.empty:
+                annual_chart = annual_standard.pivot(
+                    index="回", columns="出題基準区分", values="問題数"
+                )
+                st.line_chart(annual_chart)
+            st.dataframe(annual_standard, width="stretch", hide_index=True)
+            st.subheader("項目別出題実績と問題ID")
+            st.dataframe(
+                standard_result["項目別出題実績"],
+                width="stretch",
+                hide_index=True,
+            )
+            with st.expander("分類未確定の問題"):
+                st.dataframe(
+                    standard_result["分類未確定問題"],
+                    width="stretch",
+                    hide_index=True,
+                )
+            with st.expander("集計条件"):
+                st.dataframe(
+                    standard_result["分析条件"],
+                    width="stretch",
+                    hide_index=True,
+                )
+            standard_download_col1, standard_download_col2 = st.columns(2)
+            standard_download_col1.download_button(
+                "区分別実績をExcelでダウンロード",
+                an.to_excel_bytes(standard_result),
+                "出題基準区分別実績.xlsx",
+            )
+            standard_download_col2.download_button(
+                "区分別実績をMarkdownでダウンロード",
+                an.to_markdown(standard_result),
+                "出題基準区分別実績.md",
+            )
+        elif standard_result:
+            st.info("分析条件または入力データが変わりました。再分析してください。")
 
 with tab_search:
     st.caption("語句が問題文・選択肢に含まれる全問題(第1回〜)を、科目内で検索します。抽出漏れの確認用です。")
