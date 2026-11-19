@@ -74,6 +74,8 @@ with tab_run:
 
     if st.button("分析する", type="primary"):
         st.session_state["result"] = an.analyze(freq_file, past_file, subject, major, int(top_n), y_lo, y_hi, int(min_hits), float(min_conc))
+        st.session_state["result_question_signature"] = current_question_file_signature
+        st.session_state["result_frequency_signature"] = file_signature(freq_file)
         st.session_state.pop("article_draft", None)
 
     result = st.session_state.get("result")
@@ -150,25 +152,53 @@ with tab_run:
 
         st.subheader("note記事のたたき台")
         st.caption(
-            "テンプレートを使った文章生成です。掲載前に文章、数値、問題の出典・正答、"
-            "権利関係を確認してください。問題文や選択肢の全文は記事に含めません。"
+            "記事は分析画面の上位N・対象回とは別に、第1〜34回の上位3中項目を"
+            "4期間で比較します。分類・再出題は同期済みのレビューを利用します。"
+            "掲載前に数値、問題の出典・正答、権利関係を確認してください。"
         )
         mea = st.text_area("MEAの紹介文（任意）", key="article_mea")
         mock_results = st.text_area("自校の模試結果・集計条件（任意）", key="article_mock")
         next_theme = st.text_input("次回の分析テーマ（任意）", key="article_next")
         if st.button("記事のたたき台を作成"):
             try:
+                if (
+                    st.session_state.get("result_question_signature") != current_question_file_signature
+                    or st.session_state.get("result_frequency_signature") != file_signature(freq_file)
+                ):
+                    raise ValueError("入力ファイルが分析後に変更されています。再分析してください。")
+                article_classification = None
+                if cl.get_source_signature(review_database) == current_question_file_signature:
+                    article_classification = cl.build_classification_analysis(
+                        review_database,
+                        1, 34,
+                        str(article_summary["科目"]),
+                    )["問題別分類・根拠"]
+                article_repeats = None
+                if repeat_analysis.get_source_signature(review_database) == current_question_file_signature:
+                    pages = []
+                    offset = 0
+                    while True:
+                        page = repeat_analysis.list_review_candidates(
+                            review_database, status="全て", limit=1000, offset=offset
+                        )
+                        pages.append(page)
+                        if len(page) < 1000:
+                            break
+                        offset += len(page)
+                    article_repeats = pd.concat(pages, ignore_index=True)
+                article_data = article.build_article_data(
+                    freq_file, past_file, str(article_summary["科目"]),
+                    str(article_summary["大項目"]), article_classification, article_repeats,
+                )
                 st.session_state["article_draft"] = article.generate_article(
-                    result, mea=mea, next_theme=next_theme, mock_results=mock_results
+                    article_data, mea=mea, next_theme=next_theme, mock_results=mock_results,
                 )
             except ValueError as e:
                 st.error(str(e))
         if "article_draft" in st.session_state:
             draft = st.text_area("記事本文（編集できます）", key="article_draft", height=600)
             count = len(draft)
-            st.caption(f"文字数：{count:,}字（改行・記号を含む。目安：3,000〜4,000字）")
-            if not 3000 <= count <= 4000:
-                st.warning("文字数が目安の範囲外です。内容を確認し、必要に応じて編集してください。")
+            st.caption(f"文字数：{count:,}字（改行・記号を含む）")
             if "［" in draft and "］" in draft:
                 st.warning("未入力の項目があります。公開前に［　］内を入力してください。")
             st.download_button("記事をMarkdownでダウンロード", draft, "note記事.md", mime="text/markdown")

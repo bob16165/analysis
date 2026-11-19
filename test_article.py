@@ -1,74 +1,131 @@
 import unittest
+from unittest.mock import patch
 
 import pandas as pd
 
-import analysis
 import article
 
 
 class ArticleGenerationTests(unittest.TestCase):
     def setUp(self):
-        questions = pd.DataFrame([
-            {"大項目": "骨折", "中項目": "A", "回": 25},
-            {"大項目": "骨折", "中項目": "B", "回": 25},
-            {"大項目": "骨折", "中項目": "A", "回": 26},
-            {"大項目": "骨折", "中項目": "他", "回": 28},
+        years = [f"第{year}回" for year in range(1, 35)]
+        rows = []
+        for topic, count in (("A", 5), ("B", 4), ("C", 3), ("D", 2), ("記載なし", 99)):
+            row = {"大項目": "骨折", "中項目": topic, **{year: 0 for year in years}}
+            row["第1回"] = count
+            rows.append(row)
+        self.frequency = pd.DataFrame(rows)
+        self.years = years
+        questions = []
+        for year in range(1, 35):
+            questions.append(self.question(year, 1, "別", "他", "別の問題"))
+        questions += [
+            self.question(1, 2, "骨折", "A", "橈骨骨折を問う"),
+            self.question(10, 2, "骨折", "A", "橈骨骨折を問う"),
+            self.question(19, 2, "骨折", "A", "橈骨骨折を問う"),
+            self.question(19, 3, "骨折", "B", "選択する"),
+            self.question(28, 2, "骨折", "B", "選択する"),
+            self.question(28, 3, "骨折", "C", "選択する"),
+            self.question(28, 4, "骨折", "記載なし", "未対応"),
+        ]
+        self.questions = pd.DataFrame(questions)
+        self.details = pd.DataFrame([
+            {"問題ID": "第1回/整形外科/No.2", "Taxonomy": "Ⅰ型", "Taxonomy状態": "人間確認済み"},
+            {"問題ID": "第10回/整形外科/No.2", "Taxonomy": "判定保留", "Taxonomy状態": "人間確認済み"},
+            {"問題ID": "第19回/整形外科/No.2", "Taxonomy": "Ⅱ型", "Taxonomy状態": "ルール候補"},
         ])
-        tagged = pd.DataFrame([
-            {
-                "中項目": "A", "問題番号": 1, "問題ID": "第25回No.1", "回": 25,
-                "問題": "原文は転載しない", "選択肢1": "選択肢は転載しない",
-                "選択肢2": "b", "選択肢3": "c", "選択肢4": "d",
-                "模範解答": "1", "正答": "選択肢は転載しない",
-                "関連軸": "", "重要語": "橈骨", "正答に含まれる重要語": "", "関連疾患": "",
-            },
+        self.relations = pd.DataFrame([
+            {"question_id_a": "第1回/整形外科/No.2", "question_id_b": "第10回/整形外科/No.2",
+             "active_a": 1, "active_b": 1, "subject_a": "整形外科", "subject_b": "整形外科",
+             "round_a": 1, "round_b": 10, "review_status": "確認済み", "reviewed_type": "A", "auto_type": "A"},
+            {"question_id_a": "第10回/整形外科/No.2", "question_id_b": "第19回/整形外科/No.2",
+             "active_a": 1, "active_b": 1, "subject_a": "整形外科", "subject_b": "整形外科",
+             "round_a": 10, "round_b": 19, "review_status": "自動候補", "reviewed_type": None, "auto_type": "A"},
+            {"question_id_a": "第1回/整形外科/No.2", "question_id_b": "第19回/整形外科/No.2",
+             "active_a": 1, "active_b": 1, "subject_a": "整形外科", "subject_b": "整形外科",
+             "round_a": 1, "round_b": 19, "review_status": "対象外", "reviewed_type": "対象外", "auto_type": "A"},
+            {"question_id_a": "第1回/整形外科/No.2", "question_id_b": "第1回/整形外科/No.3",
+             "active_a": 1, "active_b": 1, "subject_a": "整形外科", "subject_b": "整形外科",
+             "round_a": 1, "round_b": 1, "review_status": "確認済み", "reviewed_type": "A", "auto_type": "A"},
         ])
-        summary, topics, trend, examples = analysis.article_tables(
-            questions, tagged, "整形外科", "骨折", ["A", "B"], 25, 28
-        )
-        self.result = {
-            "記事向け要約": summary,
-            "中項目別の出題状況": topics,
-            "対象中項目の年度推移": trend,
-            "記事向け問題例": examples,
-            "中項目別の年度推移": analysis.article_topic_trend(
-                questions, "骨折", ["A", "B"], 25, 28
-            ),
-            "中項目別の頻出語": pd.DataFrame([
-                {"中項目": "A", "順位": 1, "語": "橈骨", "出現問題数": 2, "対象問題数": 2, "問題ID": "第25回No.1"},
-            ]),
+
+    @staticmethod
+    def question(year, number, major, topic, stem):
+        return {
+            "回": year, "問題番号": number, "問題ID": f"第{year}回No.{number}",
+            "大項目": major, "中項目": topic, "問題": stem,
+            "選択肢1": "正しい", "選択肢2": "誤り", "選択肢3": "別", "選択肢4": "他",
+            "模範解答": "1", "正答": "正しい",
         }
 
-    def test_article_uses_data_and_user_inputs_without_reproducing_question(self):
-        text = article.generate_article(
-            self.result, mea="教育分析を支援します。", next_theme="脱臼",
-            mock_results="模試Aは20問中10問正答。",
-        )
-        self.assertIn("A：2問（大項目全体の50%", text)
-        self.assertIn("出題 第25回、第26回／出題なし 第28回", text)
-        self.assertIn("| 第27回 | 0 | 集計不可 | 集計不可 |", text)
-        self.assertIn("2/2問（100.0%）、1/2問（50.0%）", text)
-        self.assertIn("第25回No.1／模範解答番号：1", text)
-        self.assertIn("- A：「橈骨」2問", text)
-        self.assertIn("- B：条件を満たす語なし", text)
-        self.assertNotIn("原文は転載しない", text)
-        self.assertNotIn("選択肢は転載しない", text)
-        self.assertIn("教育分析を支援します。", text)
-        self.assertIn("模試Aは20問中10問正答。", text)
-        self.assertIn("脱臼", text)
-        self.assertTrue(3000 <= len(text) <= 4000, len(text))
+    def build(self, details=None, relations=None):
+        with patch("article.analysis.load_freq", return_value=(self.frequency, self.years)), \
+                patch("article.analysis.load_questions", return_value=self.questions), \
+                patch("article.analysis.load_dictionary", return_value={
+                    "除外語": [], "重要語(疾患・所見)": {"橈骨骨折": ""}
+                }), \
+                patch("article.analysis.load_medical_terms", return_value=[]):
+            return article.build_article_data(
+                "freq", "past", "整形外科", "骨折", details, relations
+            )
 
-    def test_empty_major_raises_instead_of_inventing_statistics(self):
-        self.result["記事向け要約"].loc[0, "大項目の問題数"] = 0
-        with self.assertRaisesRegex(ValueError, "問題がない"):
-            article.generate_article(self.result)
+    def test_scoped_periods_rankings_terms_and_classification(self):
+        data = self.build(self.details, self.relations)
+        self.assertEqual(data["順位"]["中項目"].tolist(), ["A", "B", "C"])
+        periods = data["期間別"]
+        a_periods = periods[periods["中項目"].eq("A")]
+        self.assertEqual(a_periods["期間"].tolist(),
+                         ["第1〜9回", "第10〜18回", "第19〜27回", "第28〜34回"])
+        self.assertEqual(a_periods["問題数"].tolist(), [1, 1, 1, 0])
+        row = periods[(periods["期間"] == "第28〜34回") & (periods["中項目"] == "B")].iloc[0]
+        self.assertEqual((row["問題数"], row["分母"], row["割合(%)"], row["中項目未対応"]),
+                         (1, 2, 50.0, 1))
+        taxonomy = data["Taxonomy"]
+        a = taxonomy[taxonomy["中項目"] == "A"].set_index("期間")
+        self.assertEqual(a.loc["第1〜9回", "Ⅰ型"], 1)
+        self.assertEqual(a.loc["第10〜18回", "判定保留"], 1)
+        self.assertEqual(a.loc["第19〜27回", "未確認"], 1)
+        text = article.generate_article(data)
+        self.assertIn("「橈骨骨折」：3問", text)
+        self.assertIn("第1回No.2", text)
+        self.assertIn("第19回No.2", text)
+        self.assertIn("人間確認済み：第1回/整形外科/No.2", text)
+        self.assertIn("未確認候補：第10回/整形外科/No.2", text)
+        self.assertNotIn("第1回/整形外科/No.3", text)
+        self.assertNotIn("対象外：", text)
+        self.assertIn("B：前期から現行期へ+0.0ポイント", text)
 
-    def test_missing_inputs_are_visible_and_one_year_is_not_compared(self):
-        self.result["対象中項目の年度推移"] = self.result["対象中項目の年度推移"].iloc[:1]
-        text = article.generate_article(self.result)
-        self.assertIn("期間を前後に分けた比較は控えます", text)
-        self.assertIn("［MEAの機能・提供内容を入力してください］", text)
-        self.assertIn("［次回の分析テーマを入力してください］", text)
+    def test_missing_rounds_and_unavailable_reviews_are_explicit(self):
+        self.questions = self.questions[self.questions["回"] != 2]
+        data = self.build()
+        row = data["期間別"].iloc[0]
+        self.assertEqual(row["未収録回"], [2])
+        self.assertTrue(pd.isna(row["割合(%)"]))
+        text = article.generate_article(data)
+        self.assertIn("未収録：第2回", text)
+        self.assertIn("Taxonomy：現在の過去問に同期済みの分類を確認できません", text)
+        self.assertIn("同期済みの再出題レビューを確認できません", text)
+
+    def test_incomplete_frequency_table_is_not_treated_as_full_ranking(self):
+        self.years.remove("第34回")
+        with self.assertRaisesRegex(ValueError, "第34回"):
+            self.build()
+
+    def test_selected_topics_without_questions_remain_zero(self):
+        self.questions = self.questions[
+            ~self.questions["中項目"].isin(["A", "B", "C"])
+        ]
+        data = self.build()
+        self.assertTrue(data["期間別"]["問題数"].eq(0).all())
+        self.assertIn("条件を満たす語はありません", article.generate_article(data))
+
+    def test_only_unassigned_questions_do_not_create_trend_results(self):
+        self.questions = self.questions[
+            (self.questions["大項目"] == "骨折") & (self.questions["中項目"] == "記載なし")
+        ]
+        data = self.build()
+        self.assertIsNone(data["トレンド"])
+        self.assertIn("分類済みの分析対象データがないため、判定できません", article.generate_article(data))
 
 
 if __name__ == "__main__":
