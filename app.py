@@ -11,6 +11,7 @@ import repeats as repeat_analysis
 import standard_history as sh
 import trends
 import question_review as qr
+import classification as cl
 
 st.set_page_config(page_title="出題傾向分析", layout="wide")
 st.title("国試 出題傾向分析")
@@ -48,10 +49,10 @@ if not (freq_file and past_file):
 review_database = APP_DIR / "analysis_review.sqlite3"
 current_question_file_signature = file_signature(past_file)
 
-tab_run, tab_search, tab_dict, tab_trend, tab_repeats, tab_question_review, tab_standard = st.tabs(
+tab_run, tab_search, tab_dict, tab_trend, tab_repeats, tab_question_review, tab_classification, tab_standard = st.tabs(
     [
         "分析", "語句検索", "辞書の編集", "出題トレンド", "再出題・類題",
-        "問題形式・出題構造", "出題基準別実績",
+        "問題形式・出題構造", "形式・Taxonomy", "出題基準別実績",
     ]
 )
 
@@ -512,6 +513,11 @@ with tab_question_review:
         "問題形式・知識要求レベルは問題ごとに人が確認して保存します。"
         "形式のルール候補はAI仮分類として表示し、確定集計には含めません。"
         "テーマ共有の集計と、複数科目の知識が必要だと人が確認した問題は別指標です。"
+    )
+    st.info(
+        "このタブの旧知識要求レベル（L1〜L4）と保存済みデータは互換性のため保持します。"
+        "新しい知識要求分析は「形式・Taxonomy」タブのⅠ型・Ⅱ型・Ⅲ型を使用し、"
+        "旧レベルを自動変換・集計しません。"
     )
     st.warning(
         "既存の語句一致による科目横断分析は「分析」タブに残しています。"
@@ -1163,6 +1169,494 @@ with tab_question_review:
                 )
             elif question_analysis:
                 st.info("分析条件または入力データが変わりました。再集計してください。")
+
+with tab_classification:
+    st.caption(
+        "問題形式は5項目を独立して判定し、TaxonomyはⅠ型・Ⅱ型・Ⅲ型で分類します。"
+        "大項目・中項目は既存値を参照するだけで、変更・再分類しません。"
+    )
+    st.warning(
+        "Ollamaのモデル名・接続設定が未確定です。現在は保守的なルール候補のみを作成し、"
+        "判断できない値は保留します。ルール候補は人間確認済み集計に含めません。"
+    )
+    st.caption(
+        "Ⅰ型は単純想起型、Ⅱ型は解釈型、Ⅲ型は問題解決型です。"
+        "難易度の代替指標ではありません。"
+    )
+    saved_classification_signature = cl.get_source_signature(review_database)
+    if (
+        saved_classification_signature
+        and saved_classification_signature != current_question_file_signature
+    ):
+        st.warning("過去問.xlsxが同期後に変更されています。分類対象を再同期してください。")
+
+    if st.button("過去問を分類対象へ同期", key="classification_sync"):
+        question_sheets = {
+            name: an.load_questions(past_file, name, 1, 999)
+            for name in an.sheet_names(past_file)
+        }
+        try:
+            sync_result = cl.sync_questions(
+                review_database,
+                question_sheets,
+                source_signature=current_question_file_signature,
+            )
+        except ValueError as exc:
+            st.error(str(exc))
+        else:
+            st.session_state["classification_sync_result"] = sync_result
+            st.session_state.pop("classification_analysis_result", None)
+            st.session_state.pop("classification_analysis_key", None)
+            st.success("分類対象を同期しました。分類処理は実行していません。")
+
+    if "classification_sync_result" in st.session_state:
+        st.dataframe(
+            pd.DataFrame([st.session_state["classification_sync_result"]]),
+            width="stretch",
+            hide_index=True,
+        )
+
+    classification_scope = cl.get_scope(review_database)
+    if not classification_scope["rounds"]:
+        st.info("分類データはありません。Excelを同期してください。")
+    else:
+        progress = cl.get_progress(review_database)
+        progress_columns = st.columns(4)
+        progress_columns[0].metric("対象問題数", progress["対象問題数"])
+        progress_columns[1].metric("ルール処理済み", progress["ルール処理済み"])
+        progress_columns[2].metric("未処理", progress["未処理"])
+        progress_columns[3].metric("エラー", progress["エラー"])
+
+        job = cl.get_job_status(review_database)
+        if job:
+            st.caption(
+                f"直近の処理 #{job['job_id']}: {job['status']} / "
+                f"{job.get('処理済み件数', 0)}件完了 / "
+                f"{job.get('未処理件数', 0)}件未処理 / "
+                f"{job.get('エラー件数', 0)}件エラー"
+            )
+            total = job["total_count"]
+            done = job.get("処理済み件数", 0) + job.get("エラー件数", 0)
+            st.progress(done / total if total else 0.0)
+            job_errors = cl.list_job_errors(review_database, job["job_id"])
+            if not job_errors.empty:
+                with st.expander("エラー問題と内容"):
+                    st.dataframe(job_errors, width="stretch", hide_index=True)
+
+        if job and job["status"] == "実行中":
+            process_col, pause_col = st.columns(2)
+            if process_col.button(
+                f"次の{cl.DEFAULT_BATCH_SIZE}問を処理",
+                key="classification_run_batch",
+            ):
+                try:
+                    batch_result = cl.run_rule_batch(
+                        review_database, job["job_id"], cl.DEFAULT_BATCH_SIZE
+                    )
+                except ValueError as exc:
+                    st.error(str(exc))
+                else:
+                    st.session_state["classification_batch_result"] = batch_result
+                    st.session_state.pop("classification_analysis_result", None)
+                    st.session_state.pop("classification_analysis_key", None)
+                    st.rerun()
+            if pause_col.button("バッチ間で中断", key="classification_pause"):
+                cl.pause_rule_job(review_database, job["job_id"])
+                st.rerun()
+        elif job and job["status"] == "中断":
+            if st.button("処理を再開", key="classification_resume"):
+                cl.resume_rule_job(review_database, job["job_id"])
+                st.rerun()
+        else:
+            start_col, retry_col = st.columns(2)
+            if start_col.button("ルール候補の処理を開始", key="classification_start"):
+                try:
+                    cl.start_rule_job(review_database)
+                except ValueError as exc:
+                    st.info(str(exc))
+                else:
+                    st.rerun()
+            if retry_col.button("エラー問題のみ再処理", key="classification_retry"):
+                try:
+                    cl.start_rule_job(review_database, retry_errors_only=True)
+                except ValueError as exc:
+                    st.info(str(exc))
+                else:
+                    st.rerun()
+
+        if "classification_batch_result" in st.session_state:
+            st.dataframe(
+                pd.DataFrame([st.session_state["classification_batch_result"]]),
+                width="stretch",
+                hide_index=True,
+            )
+
+        st.subheader("問題ごとの確認・修正")
+        filter_columns = st.columns(4)
+        review_subject = filter_columns[0].selectbox(
+            "科目",
+            ["全科目", *classification_scope["subjects"]],
+            key="classification_review_subject",
+        )
+        review_round = filter_columns[1].selectbox(
+            "年度",
+            ["全て", *classification_scope["rounds"]],
+            key="classification_review_round",
+        )
+        review_status_field = filter_columns[2].selectbox(
+            "確認状態の対象",
+            ["format_status", "taxonomy_status"],
+            format_func=lambda value: (
+                "問題形式" if value == "format_status" else "Taxonomy"
+            ),
+            key="classification_status_field",
+        )
+        review_status = filter_columns[3].selectbox(
+            "確認状態",
+            ["全て", *cl.REVIEW_STATUSES],
+            key="classification_review_status",
+        )
+        value_columns = st.columns(3)
+        format_dimension = value_columns[0].selectbox(
+            "形式で絞り込み",
+            ["全て", *cl.FORMAT_DIMENSIONS],
+            key="classification_format_filter",
+        )
+        format_value = value_columns[1].selectbox(
+            "形式判定",
+            ["全て", *cl.FORMAT_VALUES],
+            key="classification_format_value_filter",
+        )
+        taxonomy_filter = value_columns[2].selectbox(
+            "Taxonomyで絞り込み",
+            ["全て", *cl.TAXONOMIES],
+            key="classification_taxonomy_filter",
+        )
+        query_col, offset_col = st.columns(2)
+        review_query = query_col.text_input(
+            "問題ID・大項目・中項目で検索",
+            key="classification_review_query",
+        )
+        review_offset = offset_col.number_input(
+            "一覧の開始位置",
+            min_value=0,
+            max_value=100000,
+            value=0,
+            step=100,
+            key="classification_review_offset",
+        )
+        review_records = cl.list_classification_questions(
+            review_database,
+            subject=review_subject,
+            round_number=None if review_round == "全て" else int(review_round),
+            status_field=review_status_field,
+            status=review_status,
+            format_dimension=format_dimension,
+            format_value=format_value,
+            taxonomy=taxonomy_filter,
+            query=review_query,
+            limit=100,
+            offset=int(review_offset),
+        )
+        review_table = pd.DataFrame([{
+            "問題ID": row["problem_id"],
+            "科目": row["subject"],
+            "回": row["exam_round"],
+            "大項目": row["major"],
+            "中項目": row["middle"],
+            "形式状態": row["format_status"],
+            "形式分類": "、".join(
+                key for key, value in row["format_values"].items()
+                if value == "該当"
+            ),
+            "Taxonomy": row["taxonomy"],
+            "Taxonomy状態": row["taxonomy_status"],
+        } for row in review_records])
+        st.dataframe(review_table, width="stretch", hide_index=True)
+
+        if not review_records:
+            st.info("この条件に該当する問題はありません。")
+        else:
+            problem_ids = [row["problem_id"] for row in review_records]
+            selected_problem_id = st.selectbox(
+                "確認する問題",
+                problem_ids,
+                key="classification_selected_problem",
+            )
+            annotation = next(
+                row for row in review_records
+                if row["problem_id"] == selected_problem_id
+            )
+            question = annotation["question"]
+            st.markdown(f"**{selected_problem_id}**")
+            st.write("大項目 / 中項目", annotation["major"], "/", annotation["middle"])
+            st.write("問題文", question.get("問題", ""))
+            for choice_number, choice in enumerate(question.get("選択肢", []), 1):
+                st.write(f"選択肢{choice_number}", choice)
+            st.write("模範解答", question.get("模範解答", ""))
+            st.write("正答", question.get("正答", ""))
+            if question.get("図"):
+                st.caption(
+                    f"図参照: {question['図']}。画像内容は読み込んでおらず、"
+                    "この参照情報のみで画像使用を判定します。"
+                )
+            if question.get("解説"):
+                with st.expander("解説"):
+                    st.write(question["解説"])
+            if annotation["candidate"]:
+                with st.expander("ルール候補と根拠"):
+                    st.json(annotation["candidate"])
+            st.caption(
+                "ルール候補は暫定です。Taxonomyは症例形式・文章量・画像の有無だけで"
+                "Ⅲ型にしないでください。"
+            )
+
+            current_formats = {
+                dimension: annotation["format_values"].get(dimension, "判定保留")
+                for dimension in cl.FORMAT_DIMENSIONS
+            }
+            format_status_options = [
+                "未分類", "人間確認済み", "修正済み", "再確認待ち"
+            ]
+            taxonomy_status_options = format_status_options
+            current_format_status = (
+                annotation["format_status"]
+                if annotation["format_status"] in format_status_options
+                else "未分類"
+            )
+            current_taxonomy_status = (
+                annotation["taxonomy_status"]
+                if annotation["taxonomy_status"] in taxonomy_status_options
+                else "未分類"
+            )
+            candidate_format_reasons = annotation["candidate"].get(
+                "format_rationale", {}
+            )
+            default_format_rationale = annotation["format_rationale"] or " ".join(
+                f"{key}: {value}" for key, value in candidate_format_reasons.items()
+            )
+            default_taxonomy_rationale = (
+                annotation["taxonomy_rationale"]
+                or annotation["candidate"].get("taxonomy_rationale", "")
+            )
+            with st.form(f"classification_form_{selected_problem_id}"):
+                st.subheader("問題形式（各項目を独立判定）")
+                selected_formats = {}
+                for dimension in cl.FORMAT_DIMENSIONS:
+                    selected_formats[dimension] = st.selectbox(
+                        dimension,
+                        cl.FORMAT_VALUES,
+                        index=cl.FORMAT_VALUES.index(current_formats[dimension]),
+                        key=f"classification_format_{dimension}_{selected_problem_id}",
+                    )
+                format_status = st.selectbox(
+                    "問題形式の確認状態",
+                    format_status_options,
+                    index=format_status_options.index(current_format_status),
+                    key=f"classification_format_status_{selected_problem_id}",
+                )
+                format_rationale = st.text_area(
+                    "問題形式の根拠",
+                    value=default_format_rationale,
+                    key=f"classification_format_rationale_{selected_problem_id}",
+                )
+
+                st.subheader("Taxonomy（知識要求）")
+                taxonomy = st.selectbox(
+                    "分類",
+                    cl.TAXONOMIES,
+                    index=cl.TAXONOMIES.index(annotation["taxonomy"]),
+                    key=f"classification_taxonomy_{selected_problem_id}",
+                )
+                taxonomy_status = st.selectbox(
+                    "Taxonomyの確認状態",
+                    taxonomy_status_options,
+                    index=taxonomy_status_options.index(current_taxonomy_status),
+                    key=f"classification_taxonomy_status_{selected_problem_id}",
+                )
+                taxonomy_rationale = st.text_area(
+                    "Taxonomyの根拠",
+                    value=default_taxonomy_rationale,
+                    key=f"classification_taxonomy_rationale_{selected_problem_id}",
+                )
+                submitted = st.form_submit_button("分類・確認結果を保存")
+
+            if submitted:
+                try:
+                    changed = cl.save_classification(
+                        review_database,
+                        selected_problem_id,
+                        {
+                            "format_values": selected_formats,
+                            "format_rationale": format_rationale,
+                            "format_status": format_status,
+                            "taxonomy": taxonomy,
+                            "taxonomy_rationale": taxonomy_rationale,
+                            "taxonomy_status": taxonomy_status,
+                        },
+                    )
+                except ValueError as exc:
+                    st.error(str(exc))
+                else:
+                    st.session_state.pop("classification_analysis_result", None)
+                    st.session_state.pop("classification_analysis_key", None)
+                    st.success(
+                        "分類を保存しました。" if changed
+                        else "分類に変更はありません。"
+                    )
+                    st.rerun()
+
+            with st.expander("分類の変更履歴"):
+                st.dataframe(
+                    cl.list_classification_history(
+                        review_database, problem_id=selected_problem_id
+                    ),
+                    width="stretch",
+                    hide_index=True,
+                )
+
+        st.subheader("形式・Taxonomy分析")
+        analysis_columns = st.columns(3)
+        analysis_subject = analysis_columns[0].selectbox(
+            "分析する科目",
+            ["全科目", *classification_scope["subjects"]],
+            key="classification_analysis_subject",
+        )
+        analysis_start = analysis_columns[1].number_input(
+            "開始回",
+            min_value=1,
+            max_value=40,
+            value=min(classification_scope["rounds"]),
+            key="classification_analysis_start",
+        )
+        analysis_end = analysis_columns[2].number_input(
+            "終了回",
+            min_value=1,
+            max_value=40,
+            value=max(classification_scope["rounds"]),
+            key="classification_analysis_end",
+        )
+        analysis_key = (
+            analysis_subject, int(analysis_start), int(analysis_end),
+            current_question_file_signature,
+        )
+        if st.button("形式・Taxonomyを集計", key="classification_analysis_run"):
+            try:
+                result = cl.build_classification_analysis(
+                    review_database,
+                    int(analysis_start),
+                    int(analysis_end),
+                    analysis_subject,
+                )
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                st.session_state["classification_analysis_result"] = result
+                st.session_state["classification_analysis_key"] = analysis_key
+
+        classification_result = st.session_state.get(
+            "classification_analysis_result"
+        )
+        if (
+            classification_result
+            and st.session_state.get("classification_analysis_key") == analysis_key
+        ):
+            st.dataframe(
+                classification_result["分析条件"],
+                width="stretch",
+                hide_index=True,
+            )
+            st.dataframe(
+                classification_result["分類状況"],
+                width="stretch",
+                hide_index=True,
+            )
+            overall_formats = classification_result["問題形式別集計"].loc[
+                classification_result["問題形式別集計"]["集計軸"].eq("全体")
+            ]
+            overall_taxonomy = classification_result["Taxonomy別集計"].loc[
+                classification_result["Taxonomy別集計"]["集計軸"].eq("全体")
+            ]
+            st.subheader("問題形式（該当率の分母は確認済み該当＋非該当数）")
+            st.dataframe(overall_formats, width="stretch", hide_index=True)
+            if overall_formats["該当割合(%)"].notna().any():
+                st.bar_chart(
+                    overall_formats.set_index("問題形式")["該当割合(%)"]
+                )
+            st.caption("複数形式を同時に付与できるため、形式別割合の合計は100%を超えます。")
+            st.subheader("Taxonomy（保留・未確認は構成比の分母から除外）")
+            st.dataframe(overall_taxonomy, width="stretch", hide_index=True)
+            if overall_taxonomy["出題割合(%)"].notna().any():
+                st.bar_chart(overall_taxonomy.set_index("Taxonomy")["出題割合(%)"])
+            annual_formats = classification_result["問題形式別集計"].loc[
+                classification_result["問題形式別集計"]["集計軸"].eq("年度")
+            ]
+            annual_taxonomy = classification_result["Taxonomy別集計"].loc[
+                classification_result["Taxonomy別集計"]["集計軸"].eq("年度")
+            ]
+            st.subheader("年度別推移")
+            if (
+                not annual_formats.empty
+                and annual_formats["該当割合(%)"].notna().any()
+            ):
+                st.line_chart(
+                    annual_formats.pivot(
+                        index="回", columns="問題形式", values="該当割合(%)"
+                    )
+                )
+            if (
+                not annual_taxonomy.empty
+                and annual_taxonomy["出題割合(%)"].notna().any()
+            ):
+                st.line_chart(
+                    annual_taxonomy.pivot(
+                        index="回", columns="Taxonomy", values="出題割合(%)"
+                    )
+                )
+            subject_taxonomy = classification_result["Taxonomy別集計"].loc[
+                classification_result["Taxonomy別集計"]["集計軸"].eq("科目")
+            ]
+            st.subheader("科目ごとのTaxonomy構成比較")
+            if (
+                not subject_taxonomy.empty
+                and subject_taxonomy["出題割合(%)"].notna().any()
+            ):
+                st.bar_chart(
+                    subject_taxonomy.pivot(
+                        index="科目", columns="Taxonomy", values="出題割合(%)"
+                    )
+                )
+            with st.expander("科目・年度・大項目・中項目別の形式集計"):
+                st.dataframe(
+                    classification_result["問題形式別集計"],
+                    width="stretch",
+                    hide_index=True,
+                )
+            with st.expander("科目・年度・大項目・中項目別のTaxonomy集計"):
+                st.dataframe(
+                    classification_result["Taxonomy別集計"],
+                    width="stretch",
+                    hide_index=True,
+                )
+            with st.expander("問題別の分類・根拠"):
+                st.dataframe(
+                    classification_result["問題別分類・根拠"],
+                    width="stretch",
+                    hide_index=True,
+                )
+            export_col1, export_col2 = st.columns(2)
+            export_col1.download_button(
+                "形式・TaxonomyをExcelでダウンロード",
+                an.to_excel_bytes(classification_result),
+                "形式・Taxonomy分析.xlsx",
+            )
+            export_col2.download_button(
+                "形式・TaxonomyをMarkdownでダウンロード",
+                an.to_markdown(classification_result),
+                "形式・Taxonomy分析.md",
+            )
+        elif classification_result:
+            st.info("分析条件または入力データが変わりました。再集計してください。")
 
 with tab_standard:
     st.caption(
